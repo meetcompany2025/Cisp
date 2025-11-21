@@ -1,7 +1,9 @@
 streamlit
+python-dotenv
 sqlalchemy
 bcrypt
 pandas
 matplotlib
 numpy
 psycopg2-binary
+
