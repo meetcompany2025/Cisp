@@ -12,6 +12,7 @@ import os
 from datetime import datetime, date, time, timedelta
 from functools import wraps
 import random
+import json
 
 import streamlit as st
 import pandas as pd
@@ -48,6 +49,9 @@ users = Table(
     Column("password_hash", String, nullable=False),
     Column("role", String, nullable=False),  # admin, gestor, analista, auditor
     Column("full_name", String, nullable=True),
+    Column("is_active", Boolean, default=True),
+    Column("created_at", DateTime, default=func.now()),
+    Column("last_login", DateTime, nullable=True),
 )
 
 policies = Table(
@@ -143,6 +147,7 @@ trainings = Table(
     Column("status", String),
 )
 
+# Tabela aprimorada para logs de auditoria de ações
 audit_logs = Table(
     "audit_logs", metadata,
     Column("id", Integer, primary_key=True),
@@ -151,6 +156,23 @@ audit_logs = Table(
     Column("action", String),
     Column("target_table", String),
     Column("target_id", Integer, nullable=True),
+    Column("old_values", Text, nullable=True),  # Valores antigos (JSON)
+    Column("new_values", Text, nullable=True),  # Novos valores (JSON)
+    Column("details", Text, nullable=True),
+    Column("ip_address", String, nullable=True),
+    Column("user_agent", String, nullable=True),
+    Column("created_at", DateTime, default=func.now()),
+)
+
+# Nova tabela para logs de acesso (login/logout)
+access_logs = Table(
+    "access_logs", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("username", String),
+    Column("role", String),
+    Column("action", String),  # login, logout, failed_login
+    Column("ip_address", String, nullable=True),
+    Column("user_agent", String, nullable=True),
     Column("details", Text, nullable=True),
     Column("created_at", DateTime, default=func.now()),
 )
@@ -168,7 +190,13 @@ def bootstrap():
         r = conn.execute(select(users.c.id).where(users.c.username == "admin")).first()
         if not r:
             pw = hash_password("admin123")
-            conn.execute(users.insert().values(username="admin", password_hash=pw, role="admin", full_name="Administrador"))
+            conn.execute(users.insert().values(
+                username="admin", 
+                password_hash=pw, 
+                role="admin", 
+                full_name="Administrador",
+                is_active=True
+            ))
             conn.commit()
 
 # --------------------------
@@ -183,12 +211,57 @@ def verify_password(password: str, hashed: str) -> bool:
     except Exception:
         return False
 
-def log_action(actor, role, action, target_table=None, target_id=None, details=None):
+def get_client_info():
+    """Simula obtenção de informações do cliente (em produção, use request.headers)"""
+    import socket
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+    except:
+        ip = "127.0.0.1"
+    
+    # Simula user agent (em Streamlit não temos acesso direto ao navegador)
+    user_agent = "Streamlit-App/1.0"
+    
+    return ip, user_agent
+
+def log_access(username, role, action, details=None):
+    """Registra acesso (login/logout)"""
+    ip, user_agent = get_client_info()
+    with engine.connect() as conn:
+        conn.execute(access_logs.insert().values(
+            username=username,
+            role=role,
+            action=action,
+            ip_address=ip,
+            user_agent=user_agent,
+            details=details,
+            created_at=datetime.utcnow()
+        ))
+        conn.commit()
+
+def log_action(actor, role, action, target_table=None, target_id=None, 
+               old_values=None, new_values=None, details=None):
+    """Registra ação do usuário com valores antigos e novos"""
+    ip, user_agent = get_client_info()
+    
+    # Converte dict para JSON string se necessário
+    old_json = json.dumps(old_values, ensure_ascii=False) if old_values else None
+    new_json = json.dumps(new_values, ensure_ascii=False) if new_values else None
+    
     with engine.connect() as conn:
         conn.execute(audit_logs.insert().values(
-            actor=actor, role=role, action=action,
-            target_table=target_table, target_id=target_id,
-            details=details, created_at=datetime.utcnow()
+            actor=actor, 
+            role=role, 
+            action=action,
+            target_table=target_table, 
+            target_id=target_id,
+            old_values=old_json,
+            new_values=new_json,
+            details=details,
+            ip_address=ip,
+            user_agent=user_agent,
+            created_at=datetime.utcnow()
         ))
         conn.commit()
 
@@ -254,13 +327,38 @@ def login_ui():
         submitted = st.form_submit_button("Entrar")
         if submitted:
             with engine.connect() as conn:
-                row = conn.execute(select(users.c.id, users.c.username, users.c.password_hash, users.c.role, users.c.full_name).where(users.c.username == username)).first()
-            if row and verify_password(password, row.password_hash):
-                st.session_state["user"] = {"id": row.id, "username": row.username, "role": row.role, "full_name": row.full_name}
-                log_action(row.username, row.role, "login", details="Login bem-sucedido")
+                row = conn.execute(select(
+                    users.c.id, users.c.username, users.c.password_hash, 
+                    users.c.role, users.c.full_name, users.c.is_active
+                ).where(users.c.username == username)).first()
+            
+            if row and row.is_active and verify_password(password, row.password_hash):
+                st.session_state["user"] = {
+                    "id": row.id, 
+                    "username": row.username, 
+                    "role": row.role, 
+                    "full_name": row.full_name
+                }
+                
+                # Atualiza último login
+                with engine.connect() as conn:
+                    conn.execute(
+                        users.update()
+                        .where(users.c.id == row.id)
+                        .values(last_login=datetime.utcnow())
+                    )
+                    conn.commit()
+                
+                # Log de acesso bem-sucedido
+                log_access(row.username, row.role, "login", "Login bem-sucedido")
                 st.rerun()
+            elif row and not row.is_active:
+                st.error("Usuário desativado. Contate o administrador.")
+                log_access(row.username, row.role, "failed_login", "Usuário desativado")
             else:
                 st.error("Usuário ou senha inválidos")
+                if row:
+                    log_access(row.username, row.role, "failed_login", "Credenciais inválidas")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # --------------------------
@@ -272,7 +370,7 @@ def nav_bar():
     c1, c2, c3 = st.columns([6,2,1])
     with c3:
         if st.button("Sair"):
-            log_action(user["username"], user["role"], "logout")
+            log_access(user["username"], user["role"], "logout")
             del st.session_state["user"]
             st.rerun()
 
@@ -321,7 +419,7 @@ def nav_bar():
             break
 
 # --------------------------
-# Pages
+# Pages (com logs aprimorados)
 # --------------------------
 def page_dashboard():
     st.header("📊 Painel / Dashboard")
@@ -404,7 +502,21 @@ def page_policies():
                     ))
                     conn.commit()
                     new_id = res.inserted_primary_key[0]
-                log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_policy", "policies", new_id, details=title)
+                log_action(
+                    actor=st.session_state["user"]["username"],
+                    role=st.session_state["user"]["role"],
+                    action="create_policy",
+                    target_table="policies",
+                    target_id=new_id,
+                    old_values=None,
+                    new_values={
+                        "title": title,
+                        "version": version,
+                        "owner": owner,
+                        "status": status
+                    },
+                    details=f"Política criada: {title}"
+                )
                 st.success("Política criada")
 
 @require_roles(("analista","gestor"))
@@ -425,10 +537,26 @@ def page_assets_risks():
             submitted = st.form_submit_button("Adicionar Ativo")
             if submitted:
                 with engine.connect() as conn:
-                    res = conn.execute(assets.insert().values(name=name, type=atype, owner=owner, criticality=criticality))
+                    res = conn.execute(assets.insert().values(
+                        name=name, type=atype, owner=owner, criticality=criticality
+                    ))
                     conn.commit()
                     new_id = res.inserted_primary_key[0]
-                log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_asset", "assets", new_id, details=name)
+                log_action(
+                    actor=st.session_state["user"]["username"],
+                    role=st.session_state["user"]["role"],
+                    action="create_asset",
+                    target_table="assets",
+                    target_id=new_id,
+                    old_values=None,
+                    new_values={
+                        "name": name,
+                        "type": atype,
+                        "owner": owner,
+                        "criticality": criticality
+                    },
+                    details=f"Ativo criado: {name}"
+                )
                 st.success("Ativo adicionado")
     # Riscos
     with tabs[1]:
@@ -463,7 +591,21 @@ def page_assets_risks():
                     ))
                     conn.commit()
                     new_id = res.inserted_primary_key[0]
-                log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_risk", "risks", new_id, details=title)
+                log_action(
+                    actor=st.session_state["user"]["username"],
+                    role=st.session_state["user"]["role"],
+                    action="create_risk",
+                    target_table="risks",
+                    target_id=new_id,
+                    old_values=None,
+                    new_values={
+                        "title": title,
+                        "category": category,
+                        "owner": owner,
+                        "status": status
+                    },
+                    details=f"Risco criado: {title}"
+                )
                 st.success("Risco registrado")
 
 @require_roles(("analista","gestor","auditor"))
@@ -501,7 +643,21 @@ def page_incidents():
                     ))
                     conn.commit()
                     new_id = res.inserted_primary_key[0]
-                log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_incident", "incidents", new_id, details=title)
+                log_action(
+                    actor=st.session_state["user"]["username"],
+                    role=st.session_state["user"]["role"],
+                    action="create_incident",
+                    target_table="incidents",
+                    target_id=new_id,
+                    old_values=None,
+                    new_values={
+                        "title": title,
+                        "severity": severity,
+                        "category": category,
+                        "status": status
+                    },
+                    details=f"Incidente criado: {title}"
+                )
                 st.success("Incidente registrado")
 
 @require_roles(("gestor","analista"))
@@ -525,7 +681,20 @@ def page_privacy():
                 ))
                 conn.commit()
                 new_id = res.inserted_primary_key[0]
-            log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_dsar", "dsar", new_id, details=requester)
+            log_action(
+                actor=st.session_state["user"]["username"],
+                role=st.session_state["user"]["role"],
+                action="create_dsar",
+                target_table="dsar",
+                target_id=new_id,
+                old_values=None,
+                new_values={
+                    "requester": requester,
+                    "type": dtype,
+                    "status": status
+                },
+                details=f"DSAR criado para: {requester}"
+            )
             st.success("Solicitação registrada")
 
 @require_roles(("auditor","gestor","admin"))
@@ -543,10 +712,24 @@ def page_audits():
         submitted = st.form_submit_button("Registrar auditoria")
         if submitted:
             with engine.connect() as conn:
-                res = conn.execute(audits.insert().values(name=name, audit_date=adate, scope=scope, findings=findings, status=status))
+                res = conn.execute(audits.insert().values(
+                    name=name, audit_date=adate, scope=scope, findings=findings, status=status
+                ))
                 conn.commit()
                 new_id = res.inserted_primary_key[0]
-            log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_audit", "audits", new_id, details=name)
+            log_action(
+                actor=st.session_state["user"]["username"],
+                role=st.session_state["user"]["role"],
+                action="create_audit",
+                target_table="audits",
+                target_id=new_id,
+                old_values=None,
+                new_values={
+                    "name": name,
+                    "status": status
+                },
+                details=f"Auditoria criada: {name}"
+            )
             st.success("Auditoria registrada")
 
 @require_roles(("gestor","analista"))
@@ -564,10 +747,24 @@ def page_trainings():
         submitted = st.form_submit_button("Registrar treinamento")
         if submitted:
             with engine.connect() as conn:
-                res = conn.execute(trainings.insert().values(name=name, audience=audience, start_date=start_date, end_date=end_date, status=status))
+                res = conn.execute(trainings.insert().values(
+                    name=name, audience=audience, start_date=start_date, end_date=end_date, status=status
+                ))
                 conn.commit()
                 new_id = res.inserted_primary_key[0]
-            log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_training", "trainings", new_id, details=name)
+            log_action(
+                actor=st.session_state["user"]["username"],
+                role=st.session_state["user"]["role"],
+                action="create_training",
+                target_table="trainings",
+                target_id=new_id,
+                old_values=None,
+                new_values={
+                    "name": name,
+                    "status": status
+                },
+                details=f"Treinamento criado: {name}"
+            )
             st.success("Treinamento registrado")
 
 # --------------------------
@@ -658,33 +855,319 @@ def page_detect_autonomous():
     st.success("Simulação de deteção automática concluída. No ambiente real, estes eventos viriam via coletores/SIEM/EDR/CVE feeds.")
 
 # --------------------------
-# Admin page
+# Admin page aprimorada
 # --------------------------
 @require_roles(("admin",))
 def page_admin():
     st.header("⚙️ Administração do Sistema")
-    with engine.connect() as conn:
-        users_df = pd.read_sql(select(users.c.id, users.c.username, users.c.role, users.c.full_name), conn)
-    st.subheader("Usuários")
-    st.dataframe(users_df, use_container_width=True)
-    with st.form("create_user"):
-        username = st.text_input("Login")
-        fullname = st.text_input("Nome completo")
-        password = st.text_input("Senha", type="password")
-        role = st.selectbox("Perfil", ["admin","gestor","analista","auditor"])
-        submitted = st.form_submit_button("Criar usuário")
-        if submitted:
-            with engine.connect() as conn:
-                res = conn.execute(users.insert().values(username=username, password_hash=hash_password(password), role=role, full_name=fullname))
-                conn.commit()
-                new_id = res.inserted_primary_key[0]
-            log_action(st.session_state["user"]["username"], st.session_state["user"]["role"], "create_user", "users", new_id, details=username)
-            st.success("Usuário criado")
-    st.divider()
-    st.subheader("Logs de Auditoria (últimas 200 ações)")
-    with engine.connect() as conn:
-        logs = pd.read_sql(select(audit_logs).order_by(audit_logs.c.created_at.desc()).limit(200), conn)
-    st.dataframe(logs, use_container_width=True)
+    
+    tabs = st.tabs(["Usuários", "Logs de Acesso", "Logs de Ações", "Estatísticas"])
+    
+    # Tab 1: Usuários
+    with tabs[0]:
+        st.subheader("Gestão de Usuários")
+        with engine.connect() as conn:
+            users_df = pd.read_sql(select(
+                users.c.id, users.c.username, users.c.role, 
+                users.c.full_name, users.c.is_active, users.c.last_login
+            ), conn)
+        
+        st.dataframe(users_df, use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            with st.expander("Criar novo usuário"):
+                with st.form("create_user"):
+                    username = st.text_input("Login")
+                    fullname = st.text_input("Nome completo")
+                    password = st.text_input("Senha", type="password")
+                    role = st.selectbox("Perfil", ["admin","gestor","analista","auditor"])
+                    is_active = st.checkbox("Ativo", value=True)
+                    submitted = st.form_submit_button("Criar usuário")
+                    if submitted:
+                        with engine.connect() as conn:
+                            res = conn.execute(users.insert().values(
+                                username=username, 
+                                password_hash=hash_password(password), 
+                                role=role, 
+                                full_name=fullname,
+                                is_active=is_active
+                            ))
+                            conn.commit()
+                            new_id = res.inserted_primary_key[0]
+                        
+                        log_action(
+                            actor=st.session_state["user"]["username"],
+                            role=st.session_state["user"]["role"],
+                            action="create_user",
+                            target_table="users",
+                            target_id=new_id,
+                            old_values=None,
+                            new_values={
+                                "username": username,
+                                "role": role,
+                                "is_active": is_active
+                            },
+                            details=f"Usuário criado: {username}"
+                        )
+                        st.success("Usuário criado")
+                        st.rerun()
+        
+        with col2:
+            with st.expander("Alterar status de usuário"):
+                with st.form("toggle_user"):
+                    user_id = st.selectbox("Usuário", 
+                        [(row.id, row.username) for _, row in users_df.iterrows()],
+                        format_func=lambda x: f"{x[1]} (ID: {x[0]})"
+                    )
+                    new_status = st.selectbox("Novo status", ["Ativar", "Desativar"])
+                    submit_toggle = st.form_submit_button("Aplicar alteração")
+                    
+                    if submit_toggle and user_id:
+                        user_id_val = user_id[0]
+                        is_active_new = new_status == "Ativar"
+                        
+                        # Busca valores atuais
+                        with engine.connect() as conn:
+                            current = conn.execute(
+                                select(users.c.username, users.c.is_active)
+                                .where(users.c.id == user_id_val)
+                            ).first()
+                        
+                        if current:
+                            with engine.connect() as conn:
+                                conn.execute(
+                                    users.update()
+                                    .where(users.c.id == user_id_val)
+                                    .values(is_active=is_active_new)
+                                )
+                                conn.commit()
+                            
+                            log_action(
+                                actor=st.session_state["user"]["username"],
+                                role=st.session_state["user"]["role"],
+                                action="toggle_user_status",
+                                target_table="users",
+                                target_id=user_id_val,
+                                old_values={"is_active": current[1]},
+                                new_values={"is_active": is_active_new},
+                                details=f"Status alterado para {new_status}"
+                            )
+                            st.success(f"Usuário {'ativado' if is_active_new else 'desativado'}")
+                            st.rerun()
+    
+    # Tab 2: Logs de Acesso
+    with tabs[1]:
+        st.subheader("📋 Logs de Acesso (Login/Logout)")
+        
+        # Filtros
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            filter_user = st.text_input("Filtrar por usuário", "")
+        with col2:
+            filter_action = st.selectbox("Filtrar por ação", ["Todos", "login", "logout", "failed_login"])
+        with col3:
+            days_filter = st.selectbox("Últimos dias", [1, 7, 30, 90, 365], index=2)
+        
+        # Query com filtros
+        query = select(access_logs).order_by(access_logs.c.created_at.desc())
+        
+        if filter_user:
+            query = query.where(access_logs.c.username.ilike(f"%{filter_user}%"))
+        if filter_action != "Todos":
+            query = query.where(access_logs.c.action == filter_action)
+        
+        # Filtro de data
+        since_date = datetime.utcnow() - timedelta(days=days_filter)
+        query = query.where(access_logs.c.created_at >= since_date)
+        
+        with engine.connect() as conn:
+            access_logs_df = pd.read_sql(query.limit(500), conn)
+        
+        if not access_logs_df.empty:
+            # Estatísticas rápidas
+            st.metric("Total de registros", len(access_logs_df))
+            
+            # Tabela
+            st.dataframe(
+                access_logs_df[[
+                    "created_at", "username", "role", "action", 
+                    "ip_address", "details"
+                ]].rename(columns={
+                    "created_at": "Data/Hora",
+                    "username": "Usuário",
+                    "role": "Perfil",
+                    "action": "Ação",
+                    "ip_address": "IP",
+                    "details": "Detalhes"
+                }),
+                use_container_width=True
+            )
+            
+            # Visualizações
+            st.subheader("📈 Análise de Acessos")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Acessos por hora do dia
+                access_logs_df["hour"] = pd.to_datetime(access_logs_df["created_at"]).dt.hour
+                hourly_counts = access_logs_df.groupby("hour").size().reset_index(name="count")
+                bar_chart = alt.Chart(hourly_counts).mark_bar().encode(
+                    x=alt.X("hour:O", title="Hora do dia"),
+                    y=alt.Y("count:Q", title="Número de acessos"),
+                    tooltip=["hour", "count"]
+                )
+                st.altair_chart(bar_chart, use_container_width=True)
+            
+            with col2:
+                # Ações por tipo
+                action_counts = access_logs_df["action"].value_counts().reset_index()
+                action_counts.columns = ["action", "count"]
+                pie_chart = alt.Chart(action_counts).mark_arc().encode(
+                    theta="count:Q",
+                    color="action:N",
+                    tooltip=["action", "count"]
+                )
+                st.altair_chart(pie_chart, use_container_width=True)
+        else:
+            st.info("Nenhum registro de acesso encontrado com os filtros aplicados.")
+    
+    # Tab 3: Logs de Ações
+    with tabs[2]:
+        st.subheader("📝 Logs de Ações (CRUD)")
+        
+        # Filtros
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            filter_actor = st.text_input("Filtrar por executor", "")
+        with col2:
+            filter_table = st.selectbox("Filtrar por tabela", 
+                ["Todas", "policies", "assets", "risks", "incidents", "dsar", "audits", "trainings", "users"]
+            )
+        with col3:
+            filter_action_type = st.text_input("Filtrar por ação", "")
+        
+        # Query
+        query = select(audit_logs).order_by(audit_logs.c.created_at.desc())
+        
+        if filter_actor:
+            query = query.where(audit_logs.c.actor.ilike(f"%{filter_actor}%"))
+        if filter_table != "Todas":
+            query = query.where(audit_logs.c.target_table == filter_table)
+        if filter_action_type:
+            query = query.where(audit_logs.c.action.ilike(f"%{filter_action_type}%"))
+        
+        with engine.connect() as conn:
+            audit_logs_df = pd.read_sql(query.limit(300), conn)
+        
+        if not audit_logs_df.empty:
+            # Converter JSON strings para exibição melhor
+            def format_json(val):
+                if val and val != "None":
+                    try:
+                        parsed = json.loads(val)
+                        return json.dumps(parsed, indent=2, ensure_ascii=False)
+                    except:
+                        return val
+                return ""
+            
+            audit_logs_df["old_values_formatted"] = audit_logs_df["old_values"].apply(format_json)
+            audit_logs_df["new_values_formatted"] = audit_logs_df["new_values"].apply(format_json)
+            
+            # Tabela expandível
+            for _, row in audit_logs_df.iterrows():
+                with st.expander(f"{row['created_at']} | {row['actor']} ({row['role']}) → {row['action']} em {row['target_table']}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**Antes:**")
+                        st.code(row["old_values_formatted"] if row["old_values_formatted"] else "N/A", language="json")
+                    with col2:
+                        st.write("**Depois:**")
+                        st.code(row["new_values_formatted"] if row["new_values_formatted"] else "N/A", language="json")
+                    
+                    st.write(f"**Detalhes:** {row['details']}")
+                    st.write(f"**IP:** {row['ip_address']}")
+                    st.write(f"**User Agent:** {row['user_agent']}")
+        else:
+            st.info("Nenhum log de ação encontrado com os filtros aplicados.")
+    
+    # Tab 4: Estatísticas
+    with tabs[3]:
+        st.subheader("📊 Estatísticas do Sistema")
+        
+        with engine.connect() as conn:
+            # Contagens básicas
+            total_users = conn.execute(select(func.count()).select_from(users)).scalar()
+            active_users = conn.execute(select(func.count()).select_from(users).where(users.c.is_active == True)).scalar()
+            total_logins = conn.execute(select(func.count()).select_from(access_logs).where(access_logs.c.action == "login")).scalar()
+            total_actions = conn.execute(select(func.count()).select_from(audit_logs)).scalar()
+            
+            # Últimos 30 dias
+            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+            recent_logins = conn.execute(
+                select(func.count()).select_from(access_logs)
+                .where(access_logs.c.action == "login")
+                .where(access_logs.c.created_at >= thirty_days_ago)
+            ).scalar()
+            
+            recent_actions = conn.execute(
+                select(func.count()).select_from(audit_logs)
+                .where(audit_logs.c.created_at >= thirty_days_ago)
+            ).scalar()
+        
+        # Métricas
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Usuários Ativos", active_users, f"Total: {total_users}")
+        col2.metric("Logins (30 dias)", recent_logins, f"Total: {total_logins}")
+        col3.metric("Ações (30 dias)", recent_actions, f"Total: {total_actions}")
+        
+        # Gráfico de atividades por dia
+        with engine.connect() as conn:
+            daily_activities = pd.read_sql(
+                select(
+                    func.date(audit_logs.c.created_at).label("date"),
+                    func.count().label("count")
+                )
+                .where(audit_logs.c.created_at >= thirty_days_ago)
+                .group_by(func.date(audit_logs.c.created_at))
+                .order_by(func.date(audit_logs.c.created_at)),
+                conn
+            )
+        
+        if not daily_activities.empty:
+            st.subheader("Atividades por Dia (últimos 30 dias)")
+            line_chart = alt.Chart(daily_activities).mark_line(point=True).encode(
+                x=alt.X("date:T", title="Data"),
+                y=alt.Y("count:Q", title="Número de ações"),
+                tooltip=["date", "count"]
+            )
+            st.altair_chart(line_chart, use_container_width=True)
+        
+        # Top usuários por atividade
+        with engine.connect() as conn:
+            top_users = pd.read_sql(
+                select(
+                    audit_logs.c.actor,
+                    audit_logs.c.role,
+                    func.count().label("action_count")
+                )
+                .where(audit_logs.c.created_at >= thirty_days_ago)
+                .group_by(audit_logs.c.actor, audit_logs.c.role)
+                .order_by(func.count().desc())
+                .limit(10),
+                conn
+            )
+        
+        if not top_users.empty:
+            st.subheader("Top 10 Usuários por Atividade (30 dias)")
+            bar_chart = alt.Chart(top_users).mark_bar().encode(
+                x=alt.X("action_count:Q", title="Número de ações"),
+                y=alt.Y("actor:N", sort="-x", title="Usuário"),
+                color=alt.Color("role:N", title="Perfil"),
+                tooltip=["actor", "role", "action_count"]
+            )
+            st.altair_chart(bar_chart, use_container_width=True)
 
 # --------------------------
 # Main
