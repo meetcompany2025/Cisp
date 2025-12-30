@@ -13,6 +13,7 @@ from datetime import datetime, date, time, timedelta
 from functools import wraps
 import random
 import json
+import base64
 
 import streamlit as st
 import pandas as pd
@@ -280,7 +281,53 @@ def require_roles(allowed):
     return deco
 
 # --------------------------
-# UI: Login page (single page)
+# Função para exibir imagem
+# --------------------------
+def display_image(image_path="cisp.jpg"):
+    """
+    Exibe uma imagem na página.
+    
+    Args:
+        image_path: Caminho para a imagem (padrão: cisp.jpg)
+    """
+    try:
+        # Verifica se o arquivo existe
+        if os.path.exists(image_path):
+            # Lê a imagem em base64
+            with open(image_path, "rb") as img_file:
+                b64_string = base64.b64encode(img_file.read()).decode()
+            
+            # HTML para exibir a imagem com estilo
+            st.markdown(
+                f"""
+                <div style="text-align: center; margin-bottom: 20px;">
+                    <img src="data:image/jpeg;base64,{b64_string}" 
+                         style="max-width: 100%; max-height: 200px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        else:
+            # Se a imagem não existir, mostra um placeholder
+            st.warning(f"Imagem '{image_path}' não encontrada. Usando placeholder.")
+            st.markdown(
+                """
+                <div style="text-align: center; margin-bottom: 20px;">
+                    <div style="background: linear-gradient(135deg, #0f1724 0%, #071426 100%); 
+                                height: 150px; border-radius: 10px; display: flex; 
+                                align-items: center; justify-content: center; color: white;
+                                font-size: 24px; font-weight: bold; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
+                        🛡️ CISP Governance
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    except Exception as e:
+        st.error(f"Erro ao carregar imagem: {e}")
+
+# --------------------------
+# UI: Login page (single page) com imagem
 # --------------------------
 def login_ui():
     st.markdown(
@@ -318,6 +365,10 @@ def login_ui():
         </style>
         """, unsafe_allow_html=True
     )
+    
+    # Exibe a imagem CISP
+    display_image("cisp.jpg")
+    
     st.markdown('<div class="bg"><span class="pulse"></span><strong>🔐 CISP — Plataforma de Governança</strong><div style="font-size:12px;margin-top:6px;">Segurança, Riscos e Proteção de Dados</div></div>', unsafe_allow_html=True)
     st.markdown('<div class="card">', unsafe_allow_html=True)
     with st.form("login_form", clear_on_submit=False):
@@ -423,6 +474,10 @@ def nav_bar():
 # --------------------------
 def page_dashboard():
     st.header("📊 Painel / Dashboard")
+    
+    # Exibe a imagem CISP no dashboard também
+    display_image("cisp.jpg")
+    
     with engine.connect() as conn:
         pol_count = conn.execute(select(func.count()).select_from(policies)).scalar() or 0
         risk_count = conn.execute(select(func.count()).select_from(risks)).scalar() or 0
@@ -480,8 +535,29 @@ def page_dashboard():
 def page_policies():
     st.header("📘 Políticas")
     with engine.connect() as conn:
-        df = pd.read_sql(select(policies), conn)
-    st.dataframe(df[["id","title","version","owner","status","effective_date","next_review_date"]].sort_values("updated_at", ascending=False), use_container_width=True)
+        # CORREÇÃO AQUI: Inclui "updated_at" na seleção para poder ordenar
+        df = pd.read_sql(select(
+            policies.c.id, 
+            policies.c.title, 
+            policies.c.version, 
+            policies.c.owner, 
+            policies.c.status, 
+            policies.c.effective_date, 
+            policies.c.next_review_date,
+            policies.c.updated_at  # Adicionado para poder ordenar
+        ), conn)
+    
+    # Verifica se a coluna updated_at existe
+    if "updated_at" in df.columns:
+        df_sorted = df.sort_values("updated_at", ascending=False)
+    else:
+        df_sorted = df.sort_values("id", ascending=False)
+        st.warning("Coluna 'updated_at' não encontrada, ordenando por ID.")
+    
+    # Exibe apenas as colunas desejadas
+    display_columns = ["id","title","version","owner","status","effective_date","next_review_date"]
+    st.dataframe(df_sorted[display_columns], use_container_width=True)
+    
     with st.expander("Criar nova política"):
         with st.form("policy_create"):
             title = st.text_input("Título")
@@ -518,6 +594,7 @@ def page_policies():
                     details=f"Política criada: {title}"
                 )
                 st.success("Política criada")
+                st.rerun()
 
 @require_roles(("analista","gestor"))
 def page_assets_risks():
@@ -558,6 +635,7 @@ def page_assets_risks():
                     details=f"Ativo criado: {name}"
                 )
                 st.success("Ativo adicionado")
+                st.rerun()
     # Riscos
     with tabs[1]:
         with engine.connect() as conn:
@@ -607,6 +685,7 @@ def page_assets_risks():
                     details=f"Risco criado: {title}"
                 )
                 st.success("Risco registrado")
+                st.rerun()
 
 @require_roles(("analista","gestor","auditor"))
 def page_incidents():
@@ -659,6 +738,7 @@ def page_incidents():
                     details=f"Incidente criado: {title}"
                 )
                 st.success("Incidente registrado")
+                st.rerun()
 
 @require_roles(("gestor","analista"))
 def page_privacy():
@@ -696,6 +776,7 @@ def page_privacy():
                 details=f"DSAR criado para: {requester}"
             )
             st.success("Solicitação registrada")
+            st.rerun()
 
 @require_roles(("auditor","gestor","admin"))
 def page_audits():
@@ -731,6 +812,7 @@ def page_audits():
                 details=f"Auditoria criada: {name}"
             )
             st.success("Auditoria registrada")
+            st.rerun()
 
 @require_roles(("gestor","analista"))
 def page_trainings():
@@ -766,6 +848,7 @@ def page_trainings():
                 details=f"Treinamento criado: {name}"
             )
             st.success("Treinamento registrado")
+            st.rerun()
 
 # --------------------------
 # NOVA PÁGINA: Detecção Automática (SIMULAÇÃO)
@@ -1174,6 +1257,27 @@ def page_admin():
 # --------------------------
 def main():
     st.set_page_config(page_title="CISP Governance", layout="wide", page_icon="🛡️")
+    
+    # Estilo CSS adicional
+    st.markdown("""
+        <style>
+        .main .block-container {
+            padding-top: 2rem;
+        }
+        h1, h2, h3 {
+            color: #1E3A8A;
+        }
+        .stButton button {
+            background-color: #3B82F6;
+            color: white;
+            border-radius: 5px;
+        }
+        .stButton button:hover {
+            background-color: #2563EB;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
     bootstrap()
     if "user" not in st.session_state:
         st.session_state["user"] = None
