@@ -1,27 +1,29 @@
 """
-app.py - CISP Governance com página de Detecção Automática (simulada)
-- Login em página única
+app.py - CISP Governance — Versão Final Melhorada
+- Login com imagem cisp.jpg
 - Roles: admin, gestor, analista, auditor
 - SQLAlchemy (Postgres ou SQLite)
-- Audit logs
-- Dashboard com Altair
-- Página "Detecção Automática de Riscos" (simulação)
+- Audit logs com old_values/new_values JSON + access_logs
+- Dashboard com alertas de prazo, matriz colorida, KPIs
+- Sidebar de navegação
+- Filtros/busca em todas as tabelas
+- Detecção Automática com promoção de riscos ao BD
+- Admin: tabs Usuários / Logs Acesso / Logs Ações / Estatísticas
 """
 
 import os
-from datetime import datetime, date, time, timedelta
-from functools import wraps
-import random
 import json
 import base64
+from datetime import datetime, date, timedelta
+from functools import wraps
+import random
 
 import streamlit as st
 import pandas as pd
 import altair as alt
-import matplotlib.pyplot as plt
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, Text,
-    Date, DateTime, Boolean, ForeignKey, select, func, inspect
+    Date, DateTime, Boolean, ForeignKey, select, func, inspect, text
 )
 from sqlalchemy.exc import OperationalError
 from dotenv import load_dotenv
@@ -32,7 +34,7 @@ load_dotenv()
 # --------------------------
 # Config DB
 # --------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql+psycopg2://user:pass@host:5432/dbname
+DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL:
     engine = create_engine(DATABASE_URL, echo=False, future=True)
 else:
@@ -48,7 +50,7 @@ users = Table(
     Column("id", Integer, primary_key=True),
     Column("username", String, unique=True, nullable=False),
     Column("password_hash", String, nullable=False),
-    Column("role", String, nullable=False),  # admin, gestor, analista, auditor
+    Column("role", String, nullable=False),
     Column("full_name", String, nullable=True),
     Column("is_active", Boolean, default=True),
     Column("created_at", DateTime, default=func.now()),
@@ -148,7 +150,6 @@ trainings = Table(
     Column("status", String),
 )
 
-# Tabela aprimorada para logs de auditoria de ações
 audit_logs = Table(
     "audit_logs", metadata,
     Column("id", Integer, primary_key=True),
@@ -157,21 +158,20 @@ audit_logs = Table(
     Column("action", String),
     Column("target_table", String),
     Column("target_id", Integer, nullable=True),
-    Column("old_values", Text, nullable=True),  # Valores antigos (JSON)
-    Column("new_values", Text, nullable=True),  # Novos valores (JSON)
+    Column("old_values", Text, nullable=True),
+    Column("new_values", Text, nullable=True),
     Column("details", Text, nullable=True),
     Column("ip_address", String, nullable=True),
     Column("user_agent", String, nullable=True),
     Column("created_at", DateTime, default=func.now()),
 )
 
-# Nova tabela para logs de acesso (login/logout)
 access_logs = Table(
     "access_logs", metadata,
     Column("id", Integer, primary_key=True),
     Column("username", String),
     Column("role", String),
-    Column("action", String),  # login, logout, failed_login
+    Column("action", String),
     Column("ip_address", String, nullable=True),
     Column("user_agent", String, nullable=True),
     Column("details", Text, nullable=True),
@@ -186,17 +186,32 @@ def bootstrap():
         metadata.create_all(engine)
     except OperationalError as e:
         st.error(f"Erro criando tabelas: {e}")
-    # ensure admin exists
+
+    # Migrações para bases antigas
+    inspector = inspect(engine)
+    if "policies" in inspector.get_table_names():
+        existing = [c["name"] for c in inspector.get_columns("policies")]
+        if "updated_at" not in existing:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE policies ADD COLUMN updated_at DATETIME"))
+                conn.commit()
+    if "users" in inspector.get_table_names():
+        existing = [c["name"] for c in inspector.get_columns("users")]
+        for col, ddl in [("is_active", "BOOLEAN DEFAULT 1"),
+                         ("created_at", "DATETIME"),
+                         ("last_login", "DATETIME")]:
+            if col not in existing:
+                with engine.connect() as conn:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
+                    conn.commit()
+
     with engine.connect() as conn:
         r = conn.execute(select(users.c.id).where(users.c.username == "admin")).first()
         if not r:
             pw = hash_password("admin123")
             conn.execute(users.insert().values(
-                username="admin", 
-                password_hash=pw, 
-                role="admin", 
-                full_name="Administrador",
-                is_active=True
+                username="admin", password_hash=pw, role="admin",
+                full_name="Administrador", is_active=True
             ))
             conn.commit()
 
@@ -213,1079 +228,1517 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 def get_client_info():
-    """Simula obtenção de informações do cliente (em produção, use request.headers)"""
     import socket
     try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-    except:
+        ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
         ip = "127.0.0.1"
-    
-    # Simula user agent (em Streamlit não temos acesso direto ao navegador)
-    user_agent = "Streamlit-App/1.0"
-    
-    return ip, user_agent
+    return ip, "Streamlit-App/1.0"
 
 def log_access(username, role, action, details=None):
-    """Registra acesso (login/logout)"""
-    ip, user_agent = get_client_info()
+    ip, ua = get_client_info()
     with engine.connect() as conn:
         conn.execute(access_logs.insert().values(
-            username=username,
-            role=role,
-            action=action,
-            ip_address=ip,
-            user_agent=user_agent,
-            details=details,
-            created_at=datetime.utcnow()
+            username=username, role=role, action=action,
+            ip_address=ip, user_agent=ua,
+            details=details, created_at=datetime.utcnow()
         ))
         conn.commit()
 
-def log_action(actor, role, action, target_table=None, target_id=None, 
+def log_action(actor, role, action, target_table=None, target_id=None,
                old_values=None, new_values=None, details=None):
-    """Registra ação do usuário com valores antigos e novos"""
-    ip, user_agent = get_client_info()
-    
-    # Converte dict para JSON string se necessário
-    old_json = json.dumps(old_values, ensure_ascii=False) if old_values else None
-    new_json = json.dumps(new_values, ensure_ascii=False) if new_values else None
-    
+    ip, ua = get_client_info()
+    old_json = json.dumps(old_values, ensure_ascii=False, default=str) if old_values else None
+    new_json = json.dumps(new_values, ensure_ascii=False, default=str) if new_values else None
     with engine.connect() as conn:
         conn.execute(audit_logs.insert().values(
-            actor=actor, 
-            role=role, 
-            action=action,
-            target_table=target_table, 
-            target_id=target_id,
-            old_values=old_json,
-            new_values=new_json,
-            details=details,
-            ip_address=ip,
-            user_agent=user_agent,
+            actor=actor, role=role, action=action,
+            target_table=target_table, target_id=target_id,
+            old_values=old_json, new_values=new_json,
+            details=details, ip_address=ip, user_agent=ua,
             created_at=datetime.utcnow()
         ))
         conn.commit()
 
 def require_roles(allowed):
-    def deco(func):
-        @wraps(func)
+    def deco(fn):
+        @wraps(fn)
         def wrapper(*args, **kwargs):
             user = st.session_state.get("user")
             if not user:
                 st.error("Acesso negado: autentique-se.")
                 return
             if user["role"] == "admin" or user["role"] in allowed:
-                return func(*args, **kwargs)
-            st.warning("Permissão negada para o seu perfil.")
+                return fn(*args, **kwargs)
+            st.warning("⛔ Permissão negada para o seu perfil.")
         return wrapper
     return deco
 
 # --------------------------
-# Função para exibir imagem
+# DB helpers
 # --------------------------
-def display_image(image_path="cisp.jpg"):
-    """
-    Exibe uma imagem na página.
-    
-    Args:
-        image_path: Caminho para a imagem (padrão: cisp.jpg)
-    """
+def fetch_df(table):
+    with engine.connect() as conn:
+        return pd.read_sql(select(table), conn)
+
+def get_row(table, row_id):
+    with engine.connect() as conn:
+        row = conn.execute(select(table).where(table.c.id == row_id)).mappings().first()
+    return dict(row) if row else None
+
+def update_row(table, row_id, values):
+    with engine.connect() as conn:
+        conn.execute(table.update().where(table.c.id == row_id).values(**values))
+        conn.commit()
+
+def delete_row(table, row_id):
+    with engine.connect() as conn:
+        conn.execute(table.delete().where(table.c.id == row_id))
+        conn.commit()
+
+def days_overdue(d):
+    if not d:
+        return None
+    if isinstance(d, datetime):
+        d = d.date()
+    return (date.today() - d).days
+
+# --------------------------
+# Imagem CISP
+# --------------------------
+def display_image(image_path="cisp.jpg", max_height="180px"):
     try:
-        # Verifica se o arquivo existe
         if os.path.exists(image_path):
-            # Lê a imagem em base64
-            with open(image_path, "rb") as img_file:
-                b64_string = base64.b64encode(img_file.read()).decode()
-            
-            # HTML para exibir a imagem com estilo
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            ext = image_path.rsplit(".", 1)[-1].lower()
+            mime = "image/png" if ext == "png" else "image/jpeg"
             st.markdown(
-                f"""
-                <div style="text-align: center; margin-bottom: 20px;">
-                    <img src="data:image/jpeg;base64,{b64_string}" 
-                         style="max-width: 100%; max-height: 200px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
-                </div>
-                """,
+                f"""<div style="text-align:center; margin-bottom:18px;">
+                    <img src="data:{mime};base64,{b64}"
+                         style="max-width:100%; max-height:{max_height};
+                                border-radius:12px;
+                                box-shadow:0 4px 16px rgba(0,0,0,0.35);">
+                </div>""",
                 unsafe_allow_html=True
             )
         else:
-            # Se a imagem não existir, mostra um placeholder
-            st.warning(f"Imagem '{image_path}' não encontrada. Usando placeholder.")
             st.markdown(
-                """
-                <div style="text-align: center; margin-bottom: 20px;">
-                    <div style="background: linear-gradient(135deg, #0f1724 0%, #071426 100%); 
-                                height: 150px; border-radius: 10px; display: flex; 
-                                align-items: center; justify-content: center; color: white;
-                                font-size: 24px; font-weight: bold; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
+                f"""<div style="text-align:center; margin-bottom:18px;">
+                    <div style="background:linear-gradient(135deg,#0f1724,#071426);
+                                height:120px; border-radius:12px; display:flex;
+                                align-items:center; justify-content:center;
+                                color:white; font-size:1.6rem; font-weight:700;
+                                box-shadow:0 4px 16px rgba(0,0,0,0.35);">
                         🛡️ CISP Governance
                     </div>
-                </div>
-                """,
+                </div>""",
                 unsafe_allow_html=True
             )
     except Exception as e:
         st.error(f"Erro ao carregar imagem: {e}")
 
 # --------------------------
-# UI: Login page (single page) com imagem
+# Global CSS
 # --------------------------
-def login_ui():
-    st.markdown(
-        """
-        <style>
-        .bg {
-            background: linear-gradient(135deg,#0f1724 0%, #071426 100%);
-            height: 160px;
-            border-radius: 12px;
-            padding: 18px;
-            color: white;
-            margin-bottom: 18px;
-        }
-        .card {
-            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
-            padding: 18px;
-            border-radius: 10px;
-            box-shadow: 0 6px 18px rgba(0,0,0,0.25);
-        }
-        .pulse {
-            display:inline-block;
-            width:12px;height:12px;
-            border-radius:12px;
-            background: #2bd37b;
-            box-shadow: 0 0 0 rgba(43,211,123, .7);
-            -webkit-animation: pulse 1.8s infinite;
-            animation: pulse 1.8s infinite;
-            margin-right:8px;
-        }
-        @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(43,211,123, .7); }
-            70% { box-shadow: 0 0 0 10px rgba(43,211,123, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(43,211,123, 0); }
-        }
-        </style>
-        """, unsafe_allow_html=True
-    )
-    
-    # Exibe a imagem CISP
-    display_image("cisp.jpg")
-    
-    st.markdown('<div class="bg"><span class="pulse"></span><strong>🔐 CISP — Plataforma de Governança</strong><div style="font-size:12px;margin-top:6px;">Segurança, Riscos e Proteção de Dados</div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    with st.form("login_form", clear_on_submit=False):
-        col1, col2 = st.columns([2, 1])
-        username = col1.text_input("Usuário")
-        password = col2.text_input("Senha", type="password")
-        submitted = st.form_submit_button("Entrar")
-        if submitted:
-            with engine.connect() as conn:
-                row = conn.execute(select(
-                    users.c.id, users.c.username, users.c.password_hash, 
-                    users.c.role, users.c.full_name, users.c.is_active
-                ).where(users.c.username == username)).first()
-            
-            if row and row.is_active and verify_password(password, row.password_hash):
-                st.session_state["user"] = {
-                    "id": row.id, 
-                    "username": row.username, 
-                    "role": row.role, 
-                    "full_name": row.full_name
-                }
-                
-                # Atualiza último login
-                with engine.connect() as conn:
-                    conn.execute(
-                        users.update()
-                        .where(users.c.id == row.id)
-                        .values(last_login=datetime.utcnow())
-                    )
-                    conn.commit()
-                
-                # Log de acesso bem-sucedido
-                log_access(row.username, row.role, "login", "Login bem-sucedido")
-                st.rerun()
-            elif row and not row.is_active:
-                st.error("Usuário desativado. Contate o administrador.")
-                log_access(row.username, row.role, "failed_login", "Usuário desativado")
-            else:
-                st.error("Usuário ou senha inválidos")
-                if row:
-                    log_access(row.username, row.role, "failed_login", "Credenciais inválidas")
-    st.markdown('</div>', unsafe_allow_html=True)
+GLOBAL_CSS = """
+<style>
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0d1b2a 0%, #112240 100%);
+    border-right: 1px solid #1e3a5f;
+}
+[data-testid="stSidebar"] * { color: #cdd9e5 !important; }
+[data-testid="stSidebar"] hr { border-color: #1e3a5f; }
+
+[data-testid="metric-container"] {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 16px !important;
+}
+[data-testid="stExpander"] {
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 8px;
+}
+[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+
+.alert-banner {
+    background: linear-gradient(90deg,#7f1d1d22,#7f1d1d11);
+    border-left: 4px solid #ef4444; border-radius:6px;
+    padding:10px 16px; margin-bottom:10px;
+    font-size:.88rem; color:#fca5a5;
+}
+.warn-banner {
+    background: linear-gradient(90deg,#78350f22,#78350f11);
+    border-left: 4px solid #f59e0b; border-radius:6px;
+    padding:10px 16px; margin-bottom:10px;
+    font-size:.88rem; color:#fcd34d;
+}
+.pulse {
+    display:inline-block; width:10px; height:10px;
+    border-radius:50%; background:#2bd37b;
+    box-shadow:0 0 0 rgba(43,211,123,.7);
+    animation:pulse 1.8s infinite; margin-right:7px;
+}
+@keyframes pulse {
+    0%  { box-shadow:0 0 0 0 rgba(43,211,123,.7); }
+    70% { box-shadow:0 0 0 9px rgba(43,211,123,0); }
+    100%{ box-shadow:0 0 0 0 rgba(43,211,123,0); }
+}
+</style>
+"""
 
 # --------------------------
-# Navigation bar and role-based menu
+# Login UI
 # --------------------------
-def nav_bar():
-    user = st.session_state.get("user")
-    st.markdown(f"**Usuário:** {user['full_name'] or user['username']} — Perfil: **{user['role']}**")
-    c1, c2, c3 = st.columns([6,2,1])
-    with c3:
-        if st.button("Sair"):
+def login_ui():
+    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        # Imagem CISP na página de login
+        display_image("cisp.jpg", max_height="200px")
+
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,#0f1724,#071426);
+                    border-radius:12px; padding:18px; color:white; margin-bottom:18px;">
+            <span class="pulse"></span>
+            <strong>🔐 CISP — Plataforma de Governança</strong>
+            <div style="font-size:.78rem; margin-top:5px; opacity:.7;">
+                Segurança · Riscos · Proteção de Dados
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("👤 Utilizador", placeholder="Login")
+            password = st.text_input("🔑 Senha", type="password", placeholder="Senha")
+            submitted = st.form_submit_button("Entrar →", use_container_width=True)
+
+            if submitted:
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        select(users.c.id, users.c.username, users.c.password_hash,
+                               users.c.role, users.c.full_name, users.c.is_active)
+                        .where(users.c.username == username)
+                    ).first()
+
+                if row and row.is_active and verify_password(password, row.password_hash):
+                    st.session_state["user"] = {
+                        "id": row.id, "username": row.username,
+                        "role": row.role, "full_name": row.full_name
+                    }
+                    with engine.connect() as conn:
+                        conn.execute(users.update().where(users.c.id == row.id)
+                                     .values(last_login=datetime.utcnow()))
+                        conn.commit()
+                    log_access(row.username, row.role, "login", "Login bem-sucedido")
+                    st.rerun()
+                elif row and not row.is_active:
+                    st.error("Utilizador desativado. Contacte o administrador.")
+                    log_access(username, "", "failed_login", "Utilizador desativado")
+                else:
+                    st.error("Utilizador ou senha inválidos")
+                    if row:
+                        log_access(username, row.role, "failed_login", "Credenciais inválidas")
+
+        st.markdown("""<p style="text-align:center;color:#4b5563;font-size:.75rem;margin-top:14px;">
+            Acesso restrito a utilizadores autorizados</p>""", unsafe_allow_html=True)
+
+# --------------------------
+# Sidebar navigation
+# --------------------------
+def sidebar_nav(user):
+    with st.sidebar:
+        # Imagem CISP na sidebar
+        display_image("cisp.jpg", max_height="90px")
+
+        st.markdown(f"""
+        <div style="padding:0 0 12px;">
+            <div style="font-size:.78rem;opacity:.5;text-transform:uppercase;
+                        letter-spacing:.6px;margin-bottom:4px;">Utilizador</div>
+            <div style="font-size:.92rem;font-weight:600;">
+                {user['full_name'] or user['username']}</div>
+            <div style="font-size:.75rem;opacity:.55;">
+                {user['role'].upper()}</div>
+        </div>
+        <hr>
+        """, unsafe_allow_html=True)
+
+        menu_items = ["📊 Dashboard"]
+        if user["role"] in ("admin", "gestor"):
+            menu_items.append("📘 Políticas")
+        if user["role"] in ("admin", "gestor", "analista"):
+            menu_items.append("🗂️ Ativos & Riscos")
+        if user["role"] in ("admin", "gestor", "analista", "auditor"):
+            menu_items.append("🚨 Incidentes")
+        if user["role"] in ("admin", "gestor", "analista"):
+            menu_items.append("📄 Proteção de Dados")
+        if user["role"] in ("admin", "gestor", "auditor"):
+            menu_items.append("🔍 Auditorias")
+        if user["role"] in ("admin", "gestor", "analista"):
+            menu_items.append("🎓 Treinamentos")
+            menu_items.append("🤖 Detecção Automática")
+        if user["role"] == "admin":
+            menu_items.append("⚙️ Administração")
+
+        # Preserve navigation from quick-action buttons
+        default_idx = 0
+        if "nav" in st.session_state and st.session_state["nav"] in menu_items:
+            default_idx = menu_items.index(st.session_state["nav"])
+            del st.session_state["nav"]
+
+        choice = st.radio("Navegação", menu_items,
+                          index=default_idx, label_visibility="collapsed")
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+        if st.button("🚪 Sair", use_container_width=True):
             log_access(user["username"], user["role"], "logout")
             del st.session_state["user"]
             st.rerun()
 
-    # base pages
-    base_pages = [
-        ("Dashboard", page_dashboard),
-        ("Ativos & Riscos", page_assets_risks),
-        ("Incidentes", page_incidents),
-        ("Proteção de Dados", page_privacy),
-        ("Auditorias", page_audits),
-        ("Treinamentos", page_trainings),
-        ("Detecção Automática", page_detect_autonomous),
-    ]
-
-    # build pages according to role
-    pages = []
-    for name, func in base_pages:
-        # auditor sees only Incidentes e Auditorias
-        if user["role"] == "auditor":
-            continue  # will override later
-        # analista não vê Políticas
-        if name == "Detecção Automática":
-            # show to gestor, admin, analista (not auditor)
-            if user["role"] in ("gestor","admin","analista"):
-                pages.append((name, func))
-            continue
-        pages.append((name, func))
-
-    # insert Policies only for admin and gestor
-    if user["role"] in ("admin", "gestor"):
-        pages.insert(1, ("Políticas", page_policies))
-
-    # auditor only sees Incidentes e Auditorias
-    if user["role"] == "auditor":
-        pages = [("Incidentes", page_incidents), ("Auditorias", page_audits)]
-
-    # admin gets Admin page
-    if user["role"] == "admin":
-        pages.append(("Administração", page_admin))
-
-    menu = [p[0] for p in pages]
-    choice = st.selectbox("Navegação", menu)
-    for name, func in pages:
-        if name == choice:
-            func()
-            break
+    return choice
 
 # --------------------------
-# Pages (com logs aprimorados)
+# Dashboard
 # --------------------------
 def page_dashboard():
-    st.header("📊 Painel / Dashboard")
-    
-    # Exibe a imagem CISP no dashboard também
-    display_image("cisp.jpg")
-    
+    st.title("📊 Painel de Controlo")
+
     with engine.connect() as conn:
-        pol_count = conn.execute(select(func.count()).select_from(policies)).scalar() or 0
+        pol_count  = conn.execute(select(func.count()).select_from(policies)).scalar() or 0
         risk_count = conn.execute(select(func.count()).select_from(risks)).scalar() or 0
-        inc_count = conn.execute(select(func.count()).select_from(incidents)).scalar() or 0
+        inc_count  = conn.execute(select(func.count()).select_from(incidents)).scalar() or 0
         dsar_count = conn.execute(select(func.count()).select_from(dsar)).scalar() or 0
-        risk_rows = pd.read_sql(select(risks), conn)
-        inc_rows = pd.read_sql(select(incidents), conn)
+        risk_rows  = pd.read_sql(select(risks), conn)
+        inc_rows   = pd.read_sql(select(incidents), conn)
+        dsar_rows  = pd.read_sql(select(dsar), conn)
+        pol_rows   = pd.read_sql(select(policies), conn)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Políticas", pol_count)
-    col2.metric("Riscos", risk_count)
-    col3.metric("Incidentes", inc_count)
-    col4.metric("Solicitações (DSAR)", dsar_count)
+    # --- Alertas de prazo ---
+    alerts = []
+    if not dsar_rows.empty:
+        overdue = dsar_rows[dsar_rows.apply(lambda r:
+            r["status"] not in ("Respondido","Encerrado","Indeferido") and
+            r["due_date"] is not None and
+            (days_overdue(r["due_date"]) or 0) > 0, axis=1)]
+        if not overdue.empty:
+            alerts.append(f'<div class="alert-banner">⚠️ {len(overdue)} solicitação(ões) DSAR com prazo vencido!</div>')
 
-    st.markdown("### Matriz de Risco (probabilidade x impacto)")
-    if risk_rows.empty:
-        st.info("Não há riscos cadastrados")
-    else:
-        risk_rows["likelihood"] = risk_rows["likelihood"].astype(int)
-        risk_rows["impact"] = risk_rows["impact"].astype(int)
-        risk_rows["size"] = risk_rows["residual"].fillna(1).astype(int)
-        chart = alt.Chart(risk_rows).mark_circle().encode(
-            x=alt.X("likelihood:Q", scale=alt.Scale(domain=(0.8,5.2))),
-            y=alt.Y("impact:Q", scale=alt.Scale(domain=(0.8,5.2))),
-            size=alt.Size("size:Q", title="Risco Residual"),
-            color=alt.Color("status:N", title="Status"),
-            tooltip=["id","title","owner","controls","residual"]
-        ).properties(height=360)
-        st.altair_chart(chart, use_container_width=True)
+    if not inc_rows.empty:
+        open_crit = inc_rows[
+            (inc_rows["severity"] == "Crítica") &
+            (~inc_rows["status"].isin(["Encerrado","Recuperado"]))
+        ]
+        if not open_crit.empty:
+            alerts.append(f'<div class="alert-banner">🚨 {len(open_crit)} incidente(s) Crítico(s) em aberto!</div>')
 
-    st.markdown("### Severidade dos incidentes")
-    if inc_rows.empty:
-        st.info("Sem incidentes registrados")
-    else:
-        df = inc_rows.copy()
-        df["severity"] = df["severity"].fillna("Desconhecida")
-        cnt = df.groupby("severity").size().reset_index(name="count")
-        bar = alt.Chart(cnt).mark_bar().encode(x="severity:N", y="count:Q", tooltip=["severity","count"])
-        st.altair_chart(bar, use_container_width=True)
+    if not pol_rows.empty and "next_review_date" in pol_rows.columns:
+        overdue_pol = pol_rows[pol_rows["next_review_date"].apply(
+            lambda d: d is not None and (days_overdue(d) or 0) > 0)]
+        if not overdue_pol.empty:
+            alerts.append(f'<div class="warn-banner">📋 {len(overdue_pol)} política(s) com revisão vencida.</div>')
+
+    if alerts:
+        st.markdown("".join(alerts), unsafe_allow_html=True)
+
+    # --- KPIs ---
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📘 Políticas", pol_count)
+    c2.metric("⚠️ Riscos", risk_count)
+    c3.metric("🚨 Incidentes", inc_count)
+    c4.metric("📄 DSAR", dsar_count)
 
     st.divider()
-    st.markdown("#### Ações rápidas")
+
+    # --- Matriz de risco com quadrantes coloridos ---
+    st.subheader("Matriz de Risco")
+    if risk_rows.empty:
+        st.info("Não há riscos cadastrados.")
+    else:
+        risk_rows["likelihood"] = risk_rows["likelihood"].astype(int)
+        risk_rows["impact"]     = risk_rows["impact"].astype(int)
+        risk_rows["size"]       = risk_rows["residual"].fillna(1).astype(int)
+
+        bg = pd.DataFrame([
+            {"x1":0.8,"x2":2.5,"y1":0.8,"y2":2.5,"zone":"Baixo"},
+            {"x1":2.5,"x2":5.2,"y1":0.8,"y2":2.5,"zone":"Médio"},
+            {"x1":0.8,"x2":2.5,"y1":2.5,"y2":5.2,"zone":"Médio"},
+            {"x1":2.5,"x2":3.8,"y1":2.5,"y2":3.8,"zone":"Elevado"},
+            {"x1":3.8,"x2":5.2,"y1":2.5,"y2":5.2,"zone":"Crítico"},
+            {"x1":2.5,"x2":3.8,"y1":3.8,"y2":5.2,"zone":"Crítico"},
+        ])
+        zone_colors = {"Baixo":"#16a34a33","Médio":"#ca8a0433","Elevado":"#ea580c33","Crítico":"#dc262633"}
+        rects = alt.Chart(bg).mark_rect(opacity=0.35).encode(
+            x=alt.X("x1:Q", scale=alt.Scale(domain=(0.8,5.2))),
+            x2="x2:Q",
+            y=alt.Y("y1:Q", scale=alt.Scale(domain=(0.8,5.2))),
+            y2="y2:Q",
+            color=alt.Color("zone:N", scale=alt.Scale(
+                domain=list(zone_colors.keys()), range=list(zone_colors.values())
+            ), legend=None)
+        )
+        circles = alt.Chart(risk_rows).mark_circle(stroke="#fff", strokeWidth=1.2).encode(
+            x=alt.X("likelihood:Q", title="Probabilidade"),
+            y=alt.Y("impact:Q", title="Impacto"),
+            size=alt.Size("size:Q", title="Risco Residual", scale=alt.Scale(range=[100,700])),
+            color=alt.Color("status:N", title="Status"),
+            tooltip=["id","title","owner","controls","residual","status"]
+        )
+        st.altair_chart((rects + circles).properties(height=360), use_container_width=True)
+
+    # --- Incidentes por severidade ---
+    st.subheader("Incidentes por Severidade")
+    if inc_rows.empty:
+        st.info("Sem incidentes registados.")
+    else:
+        df_i = inc_rows.copy()
+        df_i["severity"] = df_i["severity"].fillna("Desconhecida")
+        cnt = df_i.groupby("severity").size().reset_index(name="count")
+        color_map = {"Crítica":"#ef4444","Alta":"#f97316","Média":"#3b82f6",
+                     "Baixa":"#22c55e","Desconhecida":"#6b7280"}
+        bar = alt.Chart(cnt).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+            x=alt.X("severity:N", sort=["Crítica","Alta","Média","Baixa"]),
+            y="count:Q",
+            color=alt.Color("severity:N", scale=alt.Scale(
+                domain=list(color_map.keys()), range=list(color_map.values())
+            ), legend=None),
+            tooltip=["severity","count"]
+        ).properties(height=260)
+        st.altair_chart(bar, use_container_width=True)
+
+    # --- DSAR donut ---
+    if not dsar_rows.empty:
+        st.subheader("DSAR por Status")
+        ds = dsar_rows.groupby("status").size().reset_index(name="count")
+        donut = alt.Chart(ds).mark_arc(innerRadius=55).encode(
+            theta="count:Q",
+            color=alt.Color("status:N", title="Status"),
+            tooltip=["status","count"]
+        ).properties(height=250)
+        st.altair_chart(donut, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### ⚡ Ações rápidas")
     c1, c2, c3 = st.columns(3)
-    if c1.button("Novo Risco"):
-        st.session_state["_open_tab"] = "risks_new"
+    if c1.button("➕ Novo Risco", use_container_width=True):
+        st.session_state["nav"] = "🗂️ Ativos & Riscos"
         st.rerun()
-    if c2.button("Novo Incidente"):
-        st.session_state["_open_tab"] = "incidents_new"
+    if c2.button("➕ Novo Incidente", use_container_width=True):
+        st.session_state["nav"] = "🚨 Incidentes"
         st.rerun()
-    if c3.button("Registrar DSAR"):
-        st.session_state["_open_tab"] = "dsar_new"
+    if c3.button("➕ Registrar DSAR", use_container_width=True):
+        st.session_state["nav"] = "📄 Proteção de Dados"
         st.rerun()
 
+# --------------------------
 @require_roles(("gestor",))
 def page_policies():
-    st.header("📘 Políticas")
-    with engine.connect() as conn:
-        # CORREÇÃO AQUI: Inclui "updated_at" na seleção para poder ordenar
-        df = pd.read_sql(select(
-            policies.c.id, 
-            policies.c.title, 
-            policies.c.version, 
-            policies.c.owner, 
-            policies.c.status, 
-            policies.c.effective_date, 
-            policies.c.next_review_date,
-            policies.c.updated_at  # Adicionado para poder ordenar
-        ), conn)
-    
-    # Verifica se a coluna updated_at existe
-    if "updated_at" in df.columns:
-        df_sorted = df.sort_values("updated_at", ascending=False)
-    else:
-        df_sorted = df.sort_values("id", ascending=False)
-        st.warning("Coluna 'updated_at' não encontrada, ordenando por ID.")
-    
-    # Exibe apenas as colunas desejadas
-    display_columns = ["id","title","version","owner","status","effective_date","next_review_date"]
-    st.dataframe(df_sorted[display_columns], use_container_width=True)
-    
-    with st.expander("Criar nova política"):
-        with st.form("policy_create"):
-            title = st.text_input("Título")
-            version = st.text_input("Versão", "1.0")
-            owner = st.text_input("Responsável", st.session_state["user"]["full_name"] or st.session_state["user"]["username"])
-            classification = st.selectbox("Classificação", ["Interna","Restrita","Pública"])
-            scope = st.text_area("Escopo", "Todos os colaboradores e sistemas")
-            status = st.selectbox("Status", ["Rascunho","Aprovada","Obsoleta"])
-            eff = st.date_input("Vigência", value=date.today())
-            next_rev = st.date_input("Próxima revisão", value=date(date.today().year+1, date.today().month, date.today().day))
-            body = st.text_area("Conteúdo", value="(Insira o texto da política)", height=200)
-            submitted = st.form_submit_button("Salvar política")
-            if submitted:
-                with engine.connect() as conn:
-                    res = conn.execute(policies.insert().values(
-                        title=title, version=version, owner=owner, classification=classification,
-                        scope=scope, status=status, effective_date=eff, next_review_date=next_rev, body=body, created_at=datetime.utcnow(), updated_at=datetime.utcnow()
-                    ))
-                    conn.commit()
-                    new_id = res.inserted_primary_key[0]
-                log_action(
-                    actor=st.session_state["user"]["username"],
-                    role=st.session_state["user"]["role"],
-                    action="create_policy",
-                    target_table="policies",
-                    target_id=new_id,
-                    old_values=None,
-                    new_values={
-                        "title": title,
-                        "version": version,
-                        "owner": owner,
-                        "status": status
-                    },
-                    details=f"Política criada: {title}"
-                )
-                st.success("Política criada")
-                st.rerun()
+    st.title("📘 Políticas")
 
+    with engine.connect() as conn:
+        df = pd.read_sql(select(policies), conn)
+
+    # Filtros
+    c1, c2 = st.columns([3,1])
+    search = c1.text_input("🔎 Buscar política", placeholder="Título, responsável…")
+    status_f = c2.selectbox("Status", ["Todos","Rascunho","Aprovada","Obsoleta"])
+
+    display = df.copy()
+    if search:
+        display = display[
+            display["title"].str.contains(search, case=False, na=False) |
+            display["owner"].str.contains(search, case=False, na=False)
+        ]
+    if status_f != "Todos":
+        display = display[display["status"] == status_f]
+
+    sort_col = "updated_at" if "updated_at" in df.columns else "id"
+    cols_show = ["id","title","version","owner","status","effective_date","next_review_date"]
+    st.dataframe(
+        display.sort_values(sort_col, ascending=False)[cols_show],
+        use_container_width=True, hide_index=True
+    )
+
+    with st.expander("➕ Criar nova política"):
+        with st.form("policy_create"):
+            title   = st.text_input("Título")
+            version = st.text_input("Versão", "1.0")
+            owner   = st.text_input("Responsável",
+                st.session_state["user"]["full_name"] or st.session_state["user"]["username"])
+            c1, c2 = st.columns(2)
+            classification = c1.selectbox("Classificação", ["Interna","Restrita","Pública"])
+            status  = c2.selectbox("Status", ["Rascunho","Aprovada","Obsoleta"])
+            scope   = st.text_area("Escopo", "Todos os colaboradores e sistemas")
+            c3, c4  = st.columns(2)
+            eff     = c3.date_input("Vigência", value=date.today())
+            next_rev= c4.date_input("Próxima revisão",
+                value=date(date.today().year+1, date.today().month, date.today().day))
+            body    = st.text_area("Conteúdo", value="(Insira o texto da política)", height=180)
+            if st.form_submit_button("💾 Salvar política", use_container_width=True):
+                if not title.strip():
+                    st.warning("Título é obrigatório.")
+                else:
+                    with engine.connect() as conn:
+                        res = conn.execute(policies.insert().values(
+                            title=title, version=version, owner=owner,
+                            classification=classification, scope=scope, status=status,
+                            effective_date=eff, next_review_date=next_rev, body=body,
+                            created_at=datetime.utcnow(), updated_at=datetime.utcnow()
+                        ))
+                        conn.commit()
+                        new_id = res.inserted_primary_key[0]
+                    log_action(
+                        actor=st.session_state["user"]["username"],
+                        role=st.session_state["user"]["role"],
+                        action="create_policy", target_table="policies", target_id=new_id,
+                        new_values={"title":title,"version":version,"owner":owner,"status":status},
+                        details=f"Política criada: {title}"
+                    )
+                    st.success("✅ Política criada!")
+                    st.rerun()
+
+    if not df.empty:
+        with st.expander("✏️ Editar ou excluir política existente"):
+            opts = [f"{r.id} - {r.title}" for r in df.itertuples()]
+            sel  = st.selectbox("Selecione a política", [""] + opts)
+            if sel:
+                pid  = int(sel.split(" - ")[0])
+                row  = get_row(policies, pid)
+                if row:
+                    with st.form("policy_edit"):
+                        title   = st.text_input("Título", value=row["title"])
+                        version = st.text_input("Versão", value=row["version"])
+                        owner   = st.text_input("Responsável", value=row["owner"])
+                        c1, c2  = st.columns(2)
+                        cl_opts = ["Interna","Restrita","Pública"]
+                        classification = c1.selectbox("Classificação", cl_opts,
+                            index=cl_opts.index(row["classification"]) if row["classification"] in cl_opts else 0)
+                        st_opts = ["Rascunho","Aprovada","Obsoleta"]
+                        status  = c2.selectbox("Status", st_opts,
+                            index=st_opts.index(row["status"]) if row["status"] in st_opts else 0)
+                        scope   = st.text_area("Escopo", value=row["scope"] or "")
+                        c3, c4  = st.columns(2)
+                        eff     = c3.date_input("Vigência", value=row["effective_date"] or date.today())
+                        next_rev= c4.date_input("Próxima revisão", value=row["next_review_date"] or date.today())
+                        body    = st.text_area("Conteúdo", value=row["body"] or "", height=180)
+                        ca, cb  = st.columns(2)
+                        save    = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                        delete  = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                        if save:
+                            old = {k: str(row[k]) for k in ["title","version","status","owner"]}
+                            update_row(policies, pid, {
+                                "title":title,"version":version,"owner":owner,
+                                "classification":classification,"scope":scope,"status":status,
+                                "effective_date":eff,"next_review_date":next_rev,
+                                "body":body,"updated_at":datetime.utcnow()
+                            })
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "update_policy","policies",pid,
+                                       old_values=old,
+                                       new_values={"title":title,"status":status},
+                                       details=f"Política editada: {title}")
+                            st.success("✅ Política atualizada")
+                            st.rerun()
+                        if delete:
+                            delete_row(policies, pid)
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "delete_policy","policies",pid,
+                                       old_values={"title":row["title"]},
+                                       details=f"Política excluída: {row['title']}")
+                            st.success("🗑️ Política excluída")
+                            st.rerun()
+
+# --------------------------
 @require_roles(("analista","gestor"))
 def page_assets_risks():
-    st.header("🗂️ Ativos e Riscos")
-    tabs = st.tabs(["Ativos","Riscos"])
-    # Ativos
+    st.title("🗂️ Ativos e Riscos")
+    tabs = st.tabs(["📦 Ativos", "⚠️ Riscos"])
+
     with engine.connect() as conn:
         assets_df = pd.read_sql(select(assets), conn)
+
+    # --- Ativos ---
     with tabs[0]:
         st.subheader("Ativos")
-        st.dataframe(assets_df, use_container_width=True)
+        search_a = st.text_input("🔎 Buscar ativo", key="search_asset")
+        disp_a = assets_df[
+            assets_df["name"].str.contains(search_a, case=False, na=False) |
+            assets_df["type"].str.contains(search_a, case=False, na=False)
+        ] if search_a else assets_df
+        st.dataframe(disp_a, use_container_width=True, hide_index=True)
+
         with st.form("asset_create"):
-            name = st.text_input("Nome do ativo")
-            atype = st.selectbox("Tipo", ["Informação","Aplicação","Infraestrutura","Físico","Pessoa"])
-            owner = st.text_input("Responsável")
-            criticality = st.selectbox("Criticidade", ["Baixa","Média","Alta","Crítica"])
-            submitted = st.form_submit_button("Adicionar Ativo")
-            if submitted:
-                with engine.connect() as conn:
-                    res = conn.execute(assets.insert().values(
-                        name=name, type=atype, owner=owner, criticality=criticality
-                    ))
-                    conn.commit()
-                    new_id = res.inserted_primary_key[0]
-                log_action(
-                    actor=st.session_state["user"]["username"],
-                    role=st.session_state["user"]["role"],
-                    action="create_asset",
-                    target_table="assets",
-                    target_id=new_id,
-                    old_values=None,
-                    new_values={
-                        "name": name,
-                        "type": atype,
-                        "owner": owner,
-                        "criticality": criticality
-                    },
-                    details=f"Ativo criado: {name}"
-                )
-                st.success("Ativo adicionado")
-                st.rerun()
-    # Riscos
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Nome do ativo")
+            atype = c2.selectbox("Tipo", ["Informação","Aplicação","Infraestrutura","Físico","Pessoa"])
+            c3, c4 = st.columns(2)
+            owner = c3.text_input("Responsável")
+            criticality = c4.selectbox("Criticidade", ["Baixa","Média","Alta","Crítica"])
+            if st.form_submit_button("➕ Adicionar Ativo", use_container_width=True):
+                if not name.strip():
+                    st.warning("Nome é obrigatório.")
+                else:
+                    with engine.connect() as conn:
+                        res = conn.execute(assets.insert().values(
+                            name=name, type=atype, owner=owner, criticality=criticality))
+                        conn.commit()
+                        new_id = res.inserted_primary_key[0]
+                    log_action(st.session_state["user"]["username"],
+                               st.session_state["user"]["role"],
+                               "create_asset","assets",new_id,
+                               new_values={"name":name,"type":atype,"owner":owner,"criticality":criticality},
+                               details=f"Ativo criado: {name}")
+                    st.success("✅ Ativo adicionado")
+                    st.rerun()
+
+        if not assets_df.empty:
+            with st.expander("✏️ Editar ou excluir ativo"):
+                opts = [f"{r.id} - {r.name}" for r in assets_df.itertuples()]
+                sel  = st.selectbox("Selecione o ativo", [""] + opts)
+                if sel:
+                    aid = int(sel.split(" - ")[0])
+                    row = get_row(assets, aid)
+                    if row:
+                        with st.form("asset_edit"):
+                            c1, c2 = st.columns(2)
+                            name = c1.text_input("Nome", value=row["name"])
+                            ty_opts = ["Informação","Aplicação","Infraestrutura","Físico","Pessoa"]
+                            atype = c2.selectbox("Tipo", ty_opts,
+                                index=ty_opts.index(row["type"]) if row["type"] in ty_opts else 0)
+                            c3, c4 = st.columns(2)
+                            owner = c3.text_input("Responsável", value=row["owner"])
+                            cr_opts = ["Baixa","Média","Alta","Crítica"]
+                            criticality = c4.selectbox("Criticidade", cr_opts,
+                                index=cr_opts.index(row["criticality"]) if row["criticality"] in cr_opts else 0)
+                            ca, cb = st.columns(2)
+                            save   = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                            delete = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                            if save:
+                                update_row(assets, aid, {"name":name,"type":atype,"owner":owner,"criticality":criticality})
+                                log_action(st.session_state["user"]["username"],
+                                           st.session_state["user"]["role"],
+                                           "update_asset","assets",aid,
+                                           old_values={"name":row["name"]},
+                                           new_values={"name":name,"criticality":criticality})
+                                st.success("✅ Ativo atualizado"); st.rerun()
+                            if delete:
+                                delete_row(assets, aid)
+                                log_action(st.session_state["user"]["username"],
+                                           st.session_state["user"]["role"],
+                                           "delete_asset","assets",aid,
+                                           old_values={"name":row["name"]})
+                                st.success("🗑️ Ativo excluído"); st.rerun()
+
+    # --- Riscos ---
     with tabs[1]:
         with engine.connect() as conn:
             risks_df = pd.read_sql(select(risks), conn)
-            asset_options = pd.read_sql(select(assets.c.id, assets.c.name), conn)
+            asset_opts = pd.read_sql(select(assets.c.id, assets.c.name), conn)
+
         st.subheader("Riscos")
-        st.dataframe(risks_df, use_container_width=True)
+        c1, c2 = st.columns([3,1])
+        search_r = c1.text_input("🔎 Buscar risco", key="search_risk")
+        cat_f    = c2.selectbox("Categoria", ["Todas","Cibernético","Operacional","Físico","Terceiros","Compliance"])
+        disp_r = risks_df.copy()
+        if search_r:
+            disp_r = disp_r[disp_r["title"].str.contains(search_r, case=False, na=False)]
+        if cat_f != "Todas":
+            disp_r = disp_r[disp_r["category"] == cat_f]
+        st.dataframe(disp_r, use_container_width=True, hide_index=True)
+
         with st.form("risk_create"):
-            title = st.text_input("Título do risco")
-            description = st.text_area("Descrição")
-            asset_choice = st.selectbox("Ativo (opcional)", ["Nenhum"] + asset_options["name"].tolist())
+            title       = st.text_input("Título do risco")
+            description = st.text_area("Descrição", height=70)
+            c1, c2  = st.columns(2)
+            a_choice= c1.selectbox("Ativo (opcional)", ["Nenhum"] + asset_opts["name"].tolist())
+            category= c2.selectbox("Categoria", ["Cibernético","Operacional","Físico","Terceiros","Compliance"])
             asset_id = None
-            if asset_choice != "Nenhum" and not asset_options.empty:
-                asset_id = int(asset_options[asset_options["name"] == asset_choice].id.iloc[0])
-            category = st.selectbox("Categoria", ["Cibernético","Operacional","Físico","Terceiros","Compliance"])
-            likelihood = st.slider("Probabilidade (1-5)", 1, 5, 3)
-            impact = st.slider("Impacto (1-5)", 1, 5, 3)
-            inherent = likelihood * impact
-            controls = st.text_area("Controles aplicados")
+            if a_choice != "Nenhum" and not asset_opts.empty:
+                asset_id = int(asset_opts[asset_opts["name"] == a_choice].id.iloc[0])
+            c3, c4  = st.columns(2)
+            likelihood = c3.slider("Probabilidade (1-5)", 1, 5, 3)
+            impact     = c4.slider("Impacto (1-5)", 1, 5, 3)
+            inherent   = likelihood * impact
+            st.info(f"Risco inerente: **{inherent}**")
+            controls = st.text_area("Controles aplicados", height=60)
             residual = st.slider("Risco residual (1-25)", 1, 25, inherent)
-            owner = st.text_input("Responsável pelo risco")
-            status = st.selectbox("Status", ["Aberto","Mitigando","Aceito","Transferido","Encerrado"])
-            review_date = st.date_input("Data de revisão", value=date.today())
-            submitted = st.form_submit_button("Registrar Risco")
-            if submitted:
-                with engine.connect() as conn:
-                    res = conn.execute(risks.insert().values(
-                        title=title, description=description, asset_id=asset_id, category=category,
-                        likelihood=likelihood, impact=impact, inherent=inherent, controls=controls,
-                        residual=residual, owner=owner, status=status, review_date=review_date, created_at=datetime.utcnow()
-                    ))
-                    conn.commit()
-                    new_id = res.inserted_primary_key[0]
-                log_action(
-                    actor=st.session_state["user"]["username"],
-                    role=st.session_state["user"]["role"],
-                    action="create_risk",
-                    target_table="risks",
-                    target_id=new_id,
-                    old_values=None,
-                    new_values={
-                        "title": title,
-                        "category": category,
-                        "owner": owner,
-                        "status": status
-                    },
-                    details=f"Risco criado: {title}"
-                )
-                st.success("Risco registrado")
-                st.rerun()
+            c5, c6   = st.columns(2)
+            owner    = c5.text_input("Responsável")
+            st_opts  = ["Aberto","Mitigando","Aceito","Transferido","Encerrado"]
+            status   = c6.selectbox("Status", st_opts)
+            rev_date = st.date_input("Data de revisão", value=date.today())
+            if st.form_submit_button("➕ Registrar Risco", use_container_width=True):
+                if not title.strip():
+                    st.warning("Título é obrigatório.")
+                else:
+                    with engine.connect() as conn:
+                        res = conn.execute(risks.insert().values(
+                            title=title, description=description, asset_id=asset_id,
+                            category=category, likelihood=likelihood, impact=impact,
+                            inherent=inherent, controls=controls, residual=residual,
+                            owner=owner, status=status, review_date=rev_date,
+                            created_at=datetime.utcnow()
+                        ))
+                        conn.commit()
+                        new_id = res.inserted_primary_key[0]
+                    log_action(st.session_state["user"]["username"],
+                               st.session_state["user"]["role"],
+                               "create_risk","risks",new_id,
+                               new_values={"title":title,"category":category,"owner":owner,"status":status},
+                               details=f"Risco criado: {title}")
+                    st.success("✅ Risco registado"); st.rerun()
 
-@require_roles(("analista","gestor","auditor"))
-def page_incidents():
-    st.header("🚨 Incidentes")
-    with engine.connect() as conn:
-        df = pd.read_sql(select(incidents), conn)
-    st.dataframe(df.sort_values("detected_at", ascending=False), use_container_width=True)
-    with st.expander("Registrar novo incidente"):
-        with st.form("inc_form"):
-            title = st.text_input("Título")
-            severity = st.selectbox("Severidade", ["Baixa","Média","Alta","Crítica"])
-            category = st.selectbox("Categoria", ["Dados Pessoais","Malware","Disponibilidade","Acesso Indevido","Outros"])
-            detected_date = st.date_input("Data de detecção", value=date.today())
-            detected_time = st.time_input("Hora de detecção", value=datetime.now().time())
-            detected_at = datetime.combine(detected_date, detected_time)
-            status = st.selectbox("Status", ["Aberto","Contido","Erradicado","Recuperado","Encerrado"], index=0)
-            description = st.text_area("Descrição")
-            root_cause = st.text_area("Causa raiz")
-            lessons = st.text_area("Lições aprendidas")
-            notification_required = st.checkbox("Requer notificação à autoridade/titulares")
-            notified_at = None
-            if notification_required:
-                n_date = st.date_input("Data de notificação", value=date.today())
-                n_time = st.time_input("Hora de notificação", value=datetime.now().time())
-                notified_at = datetime.combine(n_date, n_time)
-            submitted = st.form_submit_button("Registrar incidente")
-            if submitted:
-                with engine.connect() as conn:
-                    res = conn.execute(incidents.insert().values(
-                        title=title, severity=severity, category=category,
-                        detected_at=detected_at, status=status, description=description,
-                        root_cause=root_cause, lessons_learned=lessons,
-                        notification_required=bool(notification_required), notified_at=notified_at, created_at=datetime.utcnow()
-                    ))
-                    conn.commit()
-                    new_id = res.inserted_primary_key[0]
-                log_action(
-                    actor=st.session_state["user"]["username"],
-                    role=st.session_state["user"]["role"],
-                    action="create_incident",
-                    target_table="incidents",
-                    target_id=new_id,
-                    old_values=None,
-                    new_values={
-                        "title": title,
-                        "severity": severity,
-                        "category": category,
-                        "status": status
-                    },
-                    details=f"Incidente criado: {title}"
-                )
-                st.success("Incidente registrado")
-                st.rerun()
-
-@require_roles(("gestor","analista"))
-def page_privacy():
-    st.header("📄 Proteção de Dados — Solicitações (DSAR)")
-    with engine.connect() as conn:
-        df = pd.read_sql(select(dsar), conn)
-    st.dataframe(df, use_container_width=True)
-    with st.form("dsar_form"):
-        requester = st.text_input("Titular")
-        dtype = st.selectbox("Tipo", ["Acesso","Correção","Exclusão","Portabilidade","Oposição"])
-        received = st.date_input("Recebido em", value=date.today())
-        due = st.date_input("Prazo (resposta)", value=date.today())
-        status = st.selectbox("Status", ["Aberto","Em Análise","Respondido","Encerrado","Indeferido"])
-        notes = st.text_area("Observações")
-        submitted = st.form_submit_button("Registrar solicitação")
-        if submitted:
-            with engine.connect() as conn:
-                res = conn.execute(dsar.insert().values(
-                    requester=requester, type=dtype, received_date=received, due_date=due, status=status, notes=notes
-                ))
-                conn.commit()
-                new_id = res.inserted_primary_key[0]
-            log_action(
-                actor=st.session_state["user"]["username"],
-                role=st.session_state["user"]["role"],
-                action="create_dsar",
-                target_table="dsar",
-                target_id=new_id,
-                old_values=None,
-                new_values={
-                    "requester": requester,
-                    "type": dtype,
-                    "status": status
-                },
-                details=f"DSAR criado para: {requester}"
-            )
-            st.success("Solicitação registrada")
-            st.rerun()
-
-@require_roles(("auditor","gestor","admin"))
-def page_audits():
-    st.header("🔍 Auditorias")
-    with engine.connect() as conn:
-        df = pd.read_sql(select(audits), conn)
-    st.dataframe(df, use_container_width=True)
-    with st.form("audit_form"):
-        name = st.text_input("Nome da auditoria")
-        adate = st.date_input("Data", value=date.today())
-        scope = st.text_area("Escopo")
-        findings = st.text_area("Achados")
-        status = st.selectbox("Status", ["Planejada","Em Execução","Concluída"])
-        submitted = st.form_submit_button("Registrar auditoria")
-        if submitted:
-            with engine.connect() as conn:
-                res = conn.execute(audits.insert().values(
-                    name=name, audit_date=adate, scope=scope, findings=findings, status=status
-                ))
-                conn.commit()
-                new_id = res.inserted_primary_key[0]
-            log_action(
-                actor=st.session_state["user"]["username"],
-                role=st.session_state["user"]["role"],
-                action="create_audit",
-                target_table="audits",
-                target_id=new_id,
-                old_values=None,
-                new_values={
-                    "name": name,
-                    "status": status
-                },
-                details=f"Auditoria criada: {name}"
-            )
-            st.success("Auditoria registrada")
-            st.rerun()
-
-@require_roles(("gestor","analista"))
-def page_trainings():
-    st.header("🎓 Treinamentos")
-    with engine.connect() as conn:
-        df = pd.read_sql(select(trainings), conn)
-    st.dataframe(df, use_container_width=True)
-    with st.form("training_form"):
-        name = st.text_input("Treinamento")
-        audience = st.text_input("Público")
-        start_date = st.date_input("Início", value=date.today())
-        end_date = st.date_input("Término", value=date.today())
-        status = st.selectbox("Status", ["Planejada","Em Andamento","Concluída"])
-        submitted = st.form_submit_button("Registrar treinamento")
-        if submitted:
-            with engine.connect() as conn:
-                res = conn.execute(trainings.insert().values(
-                    name=name, audience=audience, start_date=start_date, end_date=end_date, status=status
-                ))
-                conn.commit()
-                new_id = res.inserted_primary_key[0]
-            log_action(
-                actor=st.session_state["user"]["username"],
-                role=st.session_state["user"]["role"],
-                action="create_training",
-                target_table="trainings",
-                target_id=new_id,
-                old_values=None,
-                new_values={
-                    "name": name,
-                    "status": status
-                },
-                details=f"Treinamento criado: {name}"
-            )
-            st.success("Treinamento registrado")
-            st.rerun()
+        if not risks_df.empty:
+            with st.expander("✏️ Editar ou excluir risco"):
+                opts = [f"{r.id} - {r.title}" for r in risks_df.itertuples()]
+                sel  = st.selectbox("Selecione o risco", [""] + opts)
+                if sel:
+                    rid = int(sel.split(" - ")[0])
+                    row = get_row(risks, rid)
+                    if row:
+                        with st.form("risk_edit"):
+                            title       = st.text_input("Título", value=row["title"])
+                            description = st.text_area("Descrição", value=row["description"] or "", height=70)
+                            c1, c2      = st.columns(2)
+                            a_choice    = c1.selectbox("Ativo (opcional)",
+                                ["Nenhum"] + asset_opts["name"].tolist(),
+                                index=(asset_opts[asset_opts["id"]==row["asset_id"]].index[0]+1)
+                                if row["asset_id"] in asset_opts["id"].tolist() else 0)
+                            asset_id = None
+                            if a_choice != "Nenhum":
+                                asset_id = int(asset_opts[asset_opts["name"]==a_choice].id.iloc[0])
+                            cat_opts = ["Cibernético","Operacional","Físico","Terceiros","Compliance"]
+                            category = c2.selectbox("Categoria", cat_opts,
+                                index=cat_opts.index(row["category"]) if row["category"] in cat_opts else 0)
+                            c3, c4   = st.columns(2)
+                            likelihood = c3.slider("Probabilidade", 1, 5, int(row["likelihood"] or 3))
+                            impact     = c4.slider("Impacto", 1, 5, int(row["impact"] or 3))
+                            inherent   = likelihood * impact
+                            controls = st.text_area("Controles", value=row["controls"] or "", height=60)
+                            residual = st.slider("Risco residual", 1, 25, int(row["residual"] or inherent))
+                            c5, c6   = st.columns(2)
+                            owner    = c5.text_input("Responsável", value=row["owner"] or "")
+                            st_opts  = ["Aberto","Mitigando","Aceito","Transferido","Encerrado"]
+                            status   = c6.selectbox("Status", st_opts,
+                                index=st_opts.index(row["status"]) if row["status"] in st_opts else 0)
+                            rev_date = st.date_input("Revisão", value=row["review_date"] or date.today())
+                            ca, cb   = st.columns(2)
+                            save     = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                            delete   = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                            if save:
+                                old = {k: str(row[k]) for k in ["title","status","likelihood","impact"]}
+                                update_row(risks, rid, {
+                                    "title":title,"description":description,"asset_id":asset_id,
+                                    "category":category,"likelihood":likelihood,"impact":impact,
+                                    "inherent":inherent,"controls":controls,"residual":residual,
+                                    "owner":owner,"status":status,"review_date":rev_date
+                                })
+                                log_action(st.session_state["user"]["username"],
+                                           st.session_state["user"]["role"],
+                                           "update_risk","risks",rid,
+                                           old_values=old,
+                                           new_values={"title":title,"status":status})
+                                st.success("✅ Risco atualizado"); st.rerun()
+                            if delete:
+                                delete_row(risks, rid)
+                                log_action(st.session_state["user"]["username"],
+                                           st.session_state["user"]["role"],
+                                           "delete_risk","risks",rid,
+                                           old_values={"title":row["title"]})
+                                st.success("🗑️ Risco excluído"); st.rerun()
 
 # --------------------------
-# NOVA PÁGINA: Detecção Automática (SIMULAÇÃO)
+@require_roles(("analista","gestor","auditor"))
+def page_incidents():
+    st.title("🚨 Incidentes")
+
+    with engine.connect() as conn:
+        df = pd.read_sql(select(incidents), conn)
+
+    c1, c2 = st.columns([3,1])
+    search_i = c1.text_input("🔎 Buscar incidente")
+    sev_f    = c2.selectbox("Severidade", ["Todas","Crítica","Alta","Média","Baixa"])
+    disp_i = df.copy()
+    if search_i:
+        disp_i = disp_i[disp_i["title"].str.contains(search_i, case=False, na=False)]
+    if sev_f != "Todas":
+        disp_i = disp_i[disp_i["severity"] == sev_f]
+    if not disp_i.empty:
+        disp_i = disp_i.sort_values("detected_at", ascending=False)
+    st.dataframe(disp_i, use_container_width=True, hide_index=True)
+
+    with st.expander("➕ Registrar novo incidente"):
+        with st.form("inc_form"):
+            title    = st.text_input("Título")
+            c1, c2   = st.columns(2)
+            severity = c1.selectbox("Severidade", ["Baixa","Média","Alta","Crítica"])
+            category = c2.selectbox("Categoria",
+                ["Dados Pessoais","Malware","Disponibilidade","Acesso Indevido","Outros"])
+            c3, c4   = st.columns(2)
+            det_date = c3.date_input("Data de detecção", value=date.today())
+            det_time = c4.time_input("Hora de detecção", value=datetime.now().time())
+            detected_at = datetime.combine(det_date, det_time)
+            status = st.selectbox("Status",
+                ["Aberto","Contido","Erradicado","Recuperado","Encerrado"])
+            description = st.text_area("Descrição", height=70)
+            root_cause  = st.text_area("Causa raiz", height=60)
+            lessons     = st.text_area("Lições aprendidas", height=60)
+            notif_req   = st.checkbox("Requer notificação à autoridade/titulares")
+            notified_at = None
+            if notif_req:
+                c5, c6 = st.columns(2)
+                notified_at = datetime.combine(
+                    c5.date_input("Data de notificação", value=date.today()),
+                    c6.time_input("Hora de notificação", value=datetime.now().time())
+                )
+            if st.form_submit_button("➕ Registrar incidente", use_container_width=True):
+                if not title.strip():
+                    st.warning("Título é obrigatório.")
+                else:
+                    with engine.connect() as conn:
+                        res = conn.execute(incidents.insert().values(
+                            title=title, severity=severity, category=category,
+                            detected_at=detected_at, status=status,
+                            description=description, root_cause=root_cause,
+                            lessons_learned=lessons,
+                            notification_required=bool(notif_req),
+                            notified_at=notified_at, created_at=datetime.utcnow()
+                        ))
+                        conn.commit()
+                        new_id = res.inserted_primary_key[0]
+                    log_action(st.session_state["user"]["username"],
+                               st.session_state["user"]["role"],
+                               "create_incident","incidents",new_id,
+                               new_values={"title":title,"severity":severity,"status":status},
+                               details=f"Incidente criado: {title}")
+                    st.success("✅ Incidente registado"); st.rerun()
+
+    if not df.empty:
+        with st.expander("✏️ Editar ou excluir incidente"):
+            opts = [f"{r.id} - {r.title}" for r in df.itertuples()]
+            sel  = st.selectbox("Selecione o incidente", [""] + opts)
+            if sel:
+                iid = int(sel.split(" - ")[0])
+                row = get_row(incidents, iid)
+                if row:
+                    with st.form("incident_edit"):
+                        title    = st.text_input("Título", value=row["title"])
+                        c1, c2   = st.columns(2)
+                        sv_opts  = ["Baixa","Média","Alta","Crítica"]
+                        severity = c1.selectbox("Severidade", sv_opts,
+                            index=sv_opts.index(row["severity"]) if row["severity"] in sv_opts else 0)
+                        ct_opts  = ["Dados Pessoais","Malware","Disponibilidade","Acesso Indevido","Outros"]
+                        category = c2.selectbox("Categoria", ct_opts,
+                            index=ct_opts.index(row["category"]) if row["category"] in ct_opts else 0)
+                        c3, c4   = st.columns(2)
+                        det_date = c3.date_input("Data detecção",
+                            value=row["detected_at"].date() if row["detected_at"] else date.today())
+                        det_time = c4.time_input("Hora detecção",
+                            value=row["detected_at"].time() if row["detected_at"] else datetime.now().time())
+                        detected_at = datetime.combine(det_date, det_time)
+                        st_opts  = ["Aberto","Contido","Erradicado","Recuperado","Encerrado"]
+                        status   = st.selectbox("Status", st_opts,
+                            index=st_opts.index(row["status"]) if row["status"] in st_opts else 0)
+                        description = st.text_area("Descrição", value=row["description"] or "", height=70)
+                        root_cause  = st.text_area("Causa raiz", value=row["root_cause"] or "", height=60)
+                        lessons     = st.text_area("Lições aprendidas", value=row["lessons_learned"] or "", height=60)
+                        notif_req   = st.checkbox("Requer notificação", value=bool(row["notification_required"]))
+                        notified_at = row["notified_at"]
+                        if notif_req:
+                            c5, c6 = st.columns(2)
+                            notified_at = datetime.combine(
+                                c5.date_input("Data notificação",
+                                    value=row["notified_at"].date() if row["notified_at"] else date.today()),
+                                c6.time_input("Hora notificação",
+                                    value=row["notified_at"].time() if row["notified_at"] else datetime.now().time())
+                            )
+                        else:
+                            notified_at = None
+                        ca, cb = st.columns(2)
+                        save   = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                        delete = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                        if save:
+                            old = {k: str(row[k]) for k in ["title","severity","status"]}
+                            update_row(incidents, iid, {
+                                "title":title,"severity":severity,"category":category,
+                                "detected_at":detected_at,"status":status,
+                                "description":description,"root_cause":root_cause,
+                                "lessons_learned":lessons,
+                                "notification_required":bool(notif_req),
+                                "notified_at":notified_at
+                            })
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "update_incident","incidents",iid,
+                                       old_values=old,
+                                       new_values={"title":title,"severity":severity,"status":status})
+                            st.success("✅ Incidente atualizado"); st.rerun()
+                        if delete:
+                            delete_row(incidents, iid)
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "delete_incident","incidents",iid,
+                                       old_values={"title":row["title"]})
+                            st.success("🗑️ Incidente excluído"); st.rerun()
+
+# --------------------------
+@require_roles(("gestor","analista"))
+def page_privacy():
+    st.title("📄 Proteção de Dados — DSAR")
+
+    with engine.connect() as conn:
+        df = pd.read_sql(select(dsar), conn)
+
+    # Indicadores de prazo
+    if not df.empty:
+        df["⚠️"] = df.apply(lambda r: "🔴 Vencido" if (
+            r["status"] not in ("Respondido","Encerrado","Indeferido") and
+            r["due_date"] is not None and (days_overdue(r["due_date"]) or 0) > 0
+        ) else ("🟡 Próximo" if (
+            r["due_date"] is not None and
+            -7 <= (days_overdue(r["due_date"]) or -99) <= 0 and
+            r["status"] not in ("Respondido","Encerrado","Indeferido")
+        ) else "✅"), axis=1)
+
+    c1, c2 = st.columns([3,1])
+    search_d = c1.text_input("🔎 Buscar titular ou tipo")
+    status_f = c2.selectbox("Status", ["Todos","Aberto","Em Análise","Respondido","Encerrado","Indeferido"])
+    disp_d = df.copy()
+    if search_d:
+        disp_d = disp_d[
+            disp_d["requester"].str.contains(search_d, case=False, na=False) |
+            disp_d["type"].str.contains(search_d, case=False, na=False)
+        ]
+    if status_f != "Todos":
+        disp_d = disp_d[disp_d["status"] == status_f]
+    st.dataframe(disp_d, use_container_width=True, hide_index=True)
+
+    with st.form("dsar_form"):
+        c1, c2    = st.columns(2)
+        requester = c1.text_input("Titular")
+        dtype     = c2.selectbox("Tipo", ["Acesso","Correção","Exclusão","Portabilidade","Oposição"])
+        c3, c4    = st.columns(2)
+        received  = c3.date_input("Recebido em", value=date.today())
+        due       = c4.date_input("Prazo", value=date.today() + timedelta(days=15))
+        status    = st.selectbox("Status", ["Aberto","Em Análise","Respondido","Encerrado","Indeferido"])
+        notes     = st.text_area("Observações", height=60)
+        if st.form_submit_button("➕ Registrar solicitação", use_container_width=True):
+            if not requester.strip():
+                st.warning("Nome do titular é obrigatório.")
+            else:
+                with engine.connect() as conn:
+                    res = conn.execute(dsar.insert().values(
+                        requester=requester, type=dtype, received_date=received,
+                        due_date=due, status=status, notes=notes
+                    ))
+                    conn.commit()
+                    new_id = res.inserted_primary_key[0]
+                log_action(st.session_state["user"]["username"],
+                           st.session_state["user"]["role"],
+                           "create_dsar","dsar",new_id,
+                           new_values={"requester":requester,"type":dtype,"status":status},
+                           details=f"DSAR criada: {requester}")
+                st.success("✅ Solicitação registada"); st.rerun()
+
+    if not df.empty:
+        with st.expander("✏️ Editar ou excluir solicitação"):
+            opts = [f"{r.id} - {r.requester}" for r in df.itertuples()]
+            sel  = st.selectbox("Selecione", [""] + opts)
+            if sel:
+                did = int(sel.split(" - ")[0])
+                row = get_row(dsar, did)
+                if row:
+                    with st.form("dsar_edit"):
+                        c1, c2    = st.columns(2)
+                        requester = c1.text_input("Titular", value=row["requester"] or "")
+                        ty_opts   = ["Acesso","Correção","Exclusão","Portabilidade","Oposição"]
+                        dtype     = c2.selectbox("Tipo", ty_opts,
+                            index=ty_opts.index(row["type"]) if row["type"] in ty_opts else 0)
+                        c3, c4    = st.columns(2)
+                        received  = c3.date_input("Recebido em", value=row["received_date"] or date.today())
+                        due       = c4.date_input("Prazo", value=row["due_date"] or date.today())
+                        st_opts   = ["Aberto","Em Análise","Respondido","Encerrado","Indeferido"]
+                        status    = st.selectbox("Status", st_opts,
+                            index=st_opts.index(row["status"]) if row["status"] in st_opts else 0)
+                        notes     = st.text_area("Observações", value=row["notes"] or "", height=60)
+                        ca, cb    = st.columns(2)
+                        save      = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                        delete    = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                        if save:
+                            old = {k: str(row[k]) for k in ["requester","status"]}
+                            update_row(dsar, did, {
+                                "requester":requester,"type":dtype,"received_date":received,
+                                "due_date":due,"status":status,"notes":notes
+                            })
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "update_dsar","dsar",did,
+                                       old_values=old,
+                                       new_values={"requester":requester,"status":status})
+                            st.success("✅ Atualizado"); st.rerun()
+                        if delete:
+                            delete_row(dsar, did)
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "delete_dsar","dsar",did,
+                                       old_values={"requester":row["requester"]})
+                            st.success("🗑️ Excluído"); st.rerun()
+
+# --------------------------
+@require_roles(("auditor","gestor","admin"))
+def page_audits():
+    st.title("🔍 Auditorias")
+
+    with engine.connect() as conn:
+        df = pd.read_sql(select(audits), conn)
+
+    search_au = st.text_input("🔎 Buscar auditoria")
+    disp_au = df[
+        df["name"].str.contains(search_au, case=False, na=False)
+    ] if search_au else df
+    st.dataframe(disp_au, use_container_width=True, hide_index=True)
+
+    with st.form("audit_form"):
+        c1, c2 = st.columns([3,1])
+        name   = c1.text_input("Nome da auditoria")
+        adate  = c2.date_input("Data", value=date.today())
+        scope    = st.text_area("Escopo", height=60)
+        findings = st.text_area("Achados", height=60)
+        status   = st.selectbox("Status", ["Planejada","Em Execução","Concluída"])
+        if st.form_submit_button("➕ Registrar auditoria", use_container_width=True):
+            if not name.strip():
+                st.warning("Nome é obrigatório.")
+            else:
+                with engine.connect() as conn:
+                    res = conn.execute(audits.insert().values(
+                        name=name, audit_date=adate, scope=scope,
+                        findings=findings, status=status
+                    ))
+                    conn.commit()
+                    new_id = res.inserted_primary_key[0]
+                log_action(st.session_state["user"]["username"],
+                           st.session_state["user"]["role"],
+                           "create_audit","audits",new_id,
+                           new_values={"name":name,"status":status},
+                           details=f"Auditoria criada: {name}")
+                st.success("✅ Auditoria registada"); st.rerun()
+
+    if not df.empty:
+        with st.expander("✏️ Editar ou excluir auditoria"):
+            opts = [f"{r.id} - {r.name}" for r in df.itertuples()]
+            sel  = st.selectbox("Selecione", [""] + opts)
+            if sel:
+                aid = int(sel.split(" - ")[0])
+                row = get_row(audits, aid)
+                if row:
+                    with st.form("audit_edit"):
+                        c1, c2   = st.columns([3,1])
+                        name     = c1.text_input("Nome", value=row["name"] or "")
+                        adate    = c2.date_input("Data", value=row["audit_date"] or date.today())
+                        scope    = st.text_area("Escopo", value=row["scope"] or "", height=60)
+                        findings = st.text_area("Achados", value=row["findings"] or "", height=60)
+                        st_opts  = ["Planejada","Em Execução","Concluída"]
+                        status   = st.selectbox("Status", st_opts,
+                            index=st_opts.index(row["status"]) if row["status"] in st_opts else 0)
+                        ca, cb   = st.columns(2)
+                        save     = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                        delete   = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                        if save:
+                            update_row(audits, aid, {"name":name,"audit_date":adate,
+                                "scope":scope,"findings":findings,"status":status})
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "update_audit","audits",aid,
+                                       old_values={"name":row["name"],"status":row["status"]},
+                                       new_values={"name":name,"status":status})
+                            st.success("✅ Atualizado"); st.rerun()
+                        if delete:
+                            delete_row(audits, aid)
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "delete_audit","audits",aid,
+                                       old_values={"name":row["name"]})
+                            st.success("🗑️ Excluído"); st.rerun()
+
+# --------------------------
+@require_roles(("gestor","analista"))
+def page_trainings():
+    st.title("🎓 Treinamentos")
+
+    with engine.connect() as conn:
+        df = pd.read_sql(select(trainings), conn)
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with st.form("training_form"):
+        c1, c2   = st.columns(2)
+        name     = c1.text_input("Treinamento")
+        audience = c2.text_input("Público")
+        c3, c4, c5 = st.columns(3)
+        start_d  = c3.date_input("Início", value=date.today())
+        end_d    = c4.date_input("Término", value=date.today())
+        status   = c5.selectbox("Status", ["Planejada","Em Andamento","Concluída"])
+        if st.form_submit_button("➕ Registrar treinamento", use_container_width=True):
+            if not name.strip():
+                st.warning("Nome é obrigatório.")
+            else:
+                with engine.connect() as conn:
+                    res = conn.execute(trainings.insert().values(
+                        name=name, audience=audience, start_date=start_d,
+                        end_date=end_d, status=status
+                    ))
+                    conn.commit()
+                    new_id = res.inserted_primary_key[0]
+                log_action(st.session_state["user"]["username"],
+                           st.session_state["user"]["role"],
+                           "create_training","trainings",new_id,
+                           new_values={"name":name,"status":status},
+                           details=f"Treinamento criado: {name}")
+                st.success("✅ Treinamento registado"); st.rerun()
+
+    if not df.empty:
+        with st.expander("✏️ Editar ou excluir treinamento"):
+            opts = [f"{r.id} - {r.name}" for r in df.itertuples()]
+            sel  = st.selectbox("Selecione", [""] + opts)
+            if sel:
+                tid = int(sel.split(" - ")[0])
+                row = get_row(trainings, tid)
+                if row:
+                    with st.form("training_edit"):
+                        c1, c2   = st.columns(2)
+                        name     = c1.text_input("Treinamento", value=row["name"] or "")
+                        audience = c2.text_input("Público", value=row["audience"] or "")
+                        c3, c4, c5 = st.columns(3)
+                        start_d  = c3.date_input("Início", value=row["start_date"] or date.today())
+                        end_d    = c4.date_input("Término", value=row["end_date"] or date.today())
+                        st_opts  = ["Planejada","Em Andamento","Concluída"]
+                        status   = c5.selectbox("Status", st_opts,
+                            index=st_opts.index(row["status"]) if row["status"] in st_opts else 0)
+                        ca, cb   = st.columns(2)
+                        save     = ca.form_submit_button("💾 Salvar", use_container_width=True)
+                        delete   = cb.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                        if save:
+                            update_row(trainings, tid, {"name":name,"audience":audience,
+                                "start_date":start_d,"end_date":end_d,"status":status})
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "update_training","trainings",tid,
+                                       old_values={"name":row["name"],"status":row["status"]},
+                                       new_values={"name":name,"status":status})
+                            st.success("✅ Atualizado"); st.rerun()
+                        if delete:
+                            delete_row(trainings, tid)
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "delete_training","trainings",tid,
+                                       old_values={"name":row["name"]})
+                            st.success("🗑️ Excluído"); st.rerun()
+
+# --------------------------
+# Detecção Automática
 # --------------------------
 @require_roles(("gestor","analista"))
 def page_detect_autonomous():
-    st.header("🔍 Detecção Automática de Riscos (Simulação)")
-    st.info("Esta página simula um fluxo de ingestão de eventos e a geração automática de riscos. Todos os dados são fictícios.")
+    st.title("🤖 Detecção Automática de Riscos")
+    st.info("Simulação de ingestão de eventos e geração automática de riscos. Dados fictícios.")
 
-    # Simular eventos/logs
     event_types = [
-        "Falha de Login",
-        "Acesso Fora do Horário",
-        "Pico de CPU",
-        "Pico de Rede",
-        "Arquivo Suspeito Detetado",
-        "Serviço Vulnerável (CVE)",
-        "Atividade Anómala de Utilizador",
-        "Erros Repetidos na Aplicação"
+        "Falha de Login","Acesso Fora do Horário","Pico de CPU","Pico de Rede",
+        "Arquivo Suspeito Detetado","Serviço Vulnerável (CVE)",
+        "Atividade Anómala de Utilizador","Erros Repetidos na Aplicação"
     ]
-    origins = ["Servidor A", "Servidor B", "Laptop XPTO", "Firewall", "API Interna", "Estação RH"]
-    severities = ["Baixa", "Média", "Alta", "Crítica"]
+    origins    = ["Servidor A","Servidor B","Laptop XPTO","Firewall","API Interna","Estação RH"]
+    severities = ["Baixa","Média","Alta","Crítica"]
 
     now = datetime.now()
-    logs = []
-    for i in range(40):
-        logs.append({
-            "timestamp": now - timedelta(minutes=random.randint(1, 6*60)),
-            "evento": random.choices(event_types, weights=[8,6,4,4,2,2,3,5])[0],
-            "origem": random.choice(origins),
-            "severidade": random.choices(severities, weights=[3,4,2,1])[0]
-        })
-    df_logs = pd.DataFrame(logs).sort_values("timestamp", ascending=False)
-    st.subheader("📡 Logs (simulados)")
-    st.dataframe(df_logs.head(30), use_container_width=True)
+    random.seed(42)
+    logs_data = [{
+        "timestamp": now - timedelta(minutes=random.randint(1, 8*60)),
+        "evento":    random.choices(event_types, weights=[8,6,4,4,2,2,3,5])[0],
+        "origem":    random.choice(origins),
+        "severidade":random.choices(severities, weights=[3,4,2,1])[0]
+    } for _ in range(60)]
+    df_logs = pd.DataFrame(logs_data).sort_values("timestamp", ascending=False)
 
-    # Motor simples de regras
-    st.subheader("🤖 Regras aplicadas e Riscos detectados")
     rules = {
-        "Falha de Login": ("Possível brute force (múltiplas falhas de autenticação)", "Alta"),
-        "Acesso Fora do Horário": ("Acesso suspeito fora do horário habitual", "Média"),
-        "Arquivo Suspeito Detetado": ("Arquivo potencialmente malicioso detectado por EDR", "Crítica"),
-        "Pico de CPU": ("Consumo anormal de CPU — possível DoS ou processo maligno", "Alta"),
-        "Pico de Rede": ("Tráfego incomum — possível exfiltração", "Alta"),
-        "Serviço Vulnerável (CVE)": ("Software com CVE conhecido exposto em produção", "Crítica"),
-        "Atividade Anómala de Utilizador": ("Comportamento de utilizador fora do padrão", "Alta"),
-        "Erros Repetidos na Aplicação": ("Erros persistentes que podem causar indisponibilidade", "Média"),
+        "Falha de Login":                  ("Possível brute force — falhas de autenticação", "Alta"),
+        "Acesso Fora do Horário":           ("Acesso suspeito fora do horário habitual", "Média"),
+        "Arquivo Suspeito Detetado":        ("Arquivo potencialmente malicioso (EDR)", "Crítica"),
+        "Pico de CPU":                      ("CPU anormal — possível DoS ou processo malicioso", "Alta"),
+        "Pico de Rede":                     ("Tráfego incomum — possível exfiltração", "Alta"),
+        "Serviço Vulnerável (CVE)":         ("Software com CVE conhecido em produção", "Crítica"),
+        "Atividade Anómala de Utilizador":  ("Comportamento de utilizador fora do padrão", "Alta"),
+        "Erros Repetidos na Aplicação":     ("Erros persistentes — risco de indisponibilidade", "Média"),
     }
+    detected = [
+        {"timestamp": r["timestamp"], "evento": r["evento"],
+         "risco": rules[r["evento"]][0], "severidade": rules[r["evento"]][1],
+         "origem": r["origem"]}
+        for _, r in df_logs.iterrows() if r["evento"] in rules
+    ]
+    df_det = pd.DataFrame(detected).sort_values("timestamp", ascending=False) if detected else pd.DataFrame()
 
-    detected = []
-    for _, row in df_logs.iterrows():
-        evt = row["evento"]
-        if evt in rules:
-            desc, sev = rules[evt]
-            detected.append({
-                "timestamp": row["timestamp"],
-                "evento": evt,
-                "risco": desc,
-                "severidade": sev,
-                "origem": row["origem"]
-            })
-    df_detected = pd.DataFrame(detected).sort_values("timestamp", ascending=False)
-    if df_detected.empty:
-        st.info("Nenhum risco detectado na simulação.")
-    else:
-        st.dataframe(df_detected.head(40), use_container_width=True)
+    tab_logs, tab_risks, tab_charts = st.tabs(["📡 Logs", "⚠️ Riscos Detetados", "📊 Gráficos"])
 
-    # Indicadores
-    st.subheader("📊 Indicadores (simulados)")
-    if not df_detected.empty:
-        sev_counts = df_detected["severidade"].value_counts().reset_index()
-        sev_counts.columns = ["severidade", "count"]
-        bar = alt.Chart(sev_counts).mark_bar().encode(x="severidade:N", y="count:Q", color="severidade:N", tooltip=["severidade","count"])
-        st.altair_chart(bar, use_container_width=True)
+    with tab_logs:
+        sev_f = st.selectbox("Filtrar severidade", ["Todas","Crítica","Alta","Média","Baixa"], key="log_sev")
+        disp = df_logs[df_logs["severidade"]==sev_f] if sev_f!="Todas" else df_logs
+        st.dataframe(disp, use_container_width=True, hide_index=True)
 
-        # origem dos eventos
-        orig_counts = df_detected["origem"].value_counts().reset_index()
-        orig_counts.columns = ["origem","count"]
-        pie = alt.Chart(orig_counts).mark_arc(innerRadius=50).encode(theta="count:Q", color="origem:N", tooltip=["origem","count"])
-        st.altair_chart(pie, use_container_width=True)
+    with tab_risks:
+        if df_det.empty:
+            st.info("Nenhum risco detetado na simulação.")
+        else:
+            sev_f2 = st.selectbox("Filtrar severidade", ["Todas","Crítica","Alta","Média","Baixa"], key="det_sev")
+            disp2 = df_det[df_det["severidade"]==sev_f2] if sev_f2!="Todas" else df_det
+            st.dataframe(disp2, use_container_width=True, hide_index=True)
 
-        # tendência temporal (últimas horas)
-        df_detected["hour"] = df_detected["timestamp"].dt.floor("H")
-        trend = df_detected.groupby("hour").size().reset_index(name="count")
-        line = alt.Chart(trend).mark_line(point=True).encode(x="hour:T", y="count:Q", tooltip=["hour","count"])
-        st.altair_chart(line, use_container_width=True)
-    st.success("Simulação de deteção automática concluída. No ambiente real, estes eventos viriam via coletores/SIEM/EDR/CVE feeds.")
-
-# --------------------------
-# Admin page aprimorada
-# --------------------------
-@require_roles(("admin",))
-def page_admin():
-    st.header("⚙️ Administração do Sistema")
-    
-    tabs = st.tabs(["Usuários", "Logs de Acesso", "Logs de Ações", "Estatísticas"])
-    
-    # Tab 1: Usuários
-    with tabs[0]:
-        st.subheader("Gestão de Usuários")
-        with engine.connect() as conn:
-            users_df = pd.read_sql(select(
-                users.c.id, users.c.username, users.c.role, 
-                users.c.full_name, users.c.is_active, users.c.last_login
-            ), conn)
-        
-        st.dataframe(users_df, use_container_width=True)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            with st.expander("Criar novo usuário"):
-                with st.form("create_user"):
-                    username = st.text_input("Login")
-                    fullname = st.text_input("Nome completo")
-                    password = st.text_input("Senha", type="password")
-                    role = st.selectbox("Perfil", ["admin","gestor","analista","auditor"])
-                    is_active = st.checkbox("Ativo", value=True)
-                    submitted = st.form_submit_button("Criar usuário")
-                    if submitted:
+            st.divider()
+            st.markdown("#### ➕ Promover risco detetado para o Registo de Riscos")
+            risk_det_opts = [f"{i} — {r['risco'][:55]}… ({r['severidade']})"
+                             for i, r in df_det.iterrows()]
+            sel_det = st.selectbox("Selecione o risco a promover", [""] + risk_det_opts)
+            if sel_det:
+                idx = int(sel_det.split(" — ")[0])
+                sel_row = df_det.iloc[idx]
+                with st.form("promote_form"):
+                    st.write(f"**Evento:** {sel_row['evento']}  |  **Origem:** {sel_row['origem']}")
+                    title_p = st.text_input("Título", value=sel_row["risco"][:80])
+                    desc_p  = st.text_area("Descrição",
+                        value=f"Detetado via simulação SIEM. Evento: {sel_row['evento']}. Origem: {sel_row['origem']}.",
+                        height=70)
+                    sev_map = {"Crítica":5,"Alta":4,"Média":3,"Baixa":2}
+                    lk = sev_map.get(sel_row["severidade"], 3)
+                    owner_p = st.text_input("Responsável",
+                        value=st.session_state["user"]["full_name"] or st.session_state["user"]["username"])
+                    if st.form_submit_button("✅ Registrar no Registo de Riscos", use_container_width=True):
                         with engine.connect() as conn:
-                            res = conn.execute(users.insert().values(
-                                username=username, 
-                                password_hash=hash_password(password), 
-                                role=role, 
-                                full_name=fullname,
-                                is_active=is_active
+                            res = conn.execute(risks.insert().values(
+                                title=title_p, description=desc_p, category="Cibernético",
+                                likelihood=lk, impact=lk, inherent=lk*lk,
+                                controls="(A definir)", residual=lk*lk,
+                                owner=owner_p, status="Aberto",
+                                review_date=date.today()+timedelta(days=30),
+                                created_at=datetime.utcnow()
                             ))
                             conn.commit()
                             new_id = res.inserted_primary_key[0]
-                        
-                        log_action(
-                            actor=st.session_state["user"]["username"],
-                            role=st.session_state["user"]["role"],
-                            action="create_user",
-                            target_table="users",
-                            target_id=new_id,
-                            old_values=None,
-                            new_values={
-                                "username": username,
-                                "role": role,
-                                "is_active": is_active
-                            },
-                            details=f"Usuário criado: {username}"
-                        )
-                        st.success("Usuário criado")
-                        st.rerun()
-        
-        with col2:
-            with st.expander("Alterar status de usuário"):
-                with st.form("toggle_user"):
-                    user_id = st.selectbox("Usuário", 
-                        [(row.id, row.username) for _, row in users_df.iterrows()],
-                        format_func=lambda x: f"{x[1]} (ID: {x[0]})"
-                    )
-                    new_status = st.selectbox("Novo status", ["Ativar", "Desativar"])
-                    submit_toggle = st.form_submit_button("Aplicar alteração")
-                    
-                    if submit_toggle and user_id:
-                        user_id_val = user_id[0]
-                        is_active_new = new_status == "Ativar"
-                        
-                        # Busca valores atuais
-                        with engine.connect() as conn:
-                            current = conn.execute(
-                                select(users.c.username, users.c.is_active)
-                                .where(users.c.id == user_id_val)
-                            ).first()
-                        
-                        if current:
+                        log_action(st.session_state["user"]["username"],
+                                   st.session_state["user"]["role"],
+                                   "promote_detected_risk","risks",new_id,
+                                   new_values={"title":title_p,"severity":sel_row["severidade"]},
+                                   details="Risco promovido da detecção automática")
+                        st.success(f"✅ Risco registado com ID #{new_id}! Aceda a Ativos & Riscos.")
+
+    with tab_charts:
+        if not df_det.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Por Severidade")
+                sc = df_det["severidade"].value_counts().reset_index()
+                sc.columns = ["severidade","count"]
+                cm = {"Crítica":"#ef4444","Alta":"#f97316","Média":"#3b82f6","Baixa":"#22c55e"}
+                bar = alt.Chart(sc).mark_bar(cornerRadiusTopLeft=4,cornerRadiusTopRight=4).encode(
+                    x=alt.X("severidade:N",sort=["Crítica","Alta","Média","Baixa"]),
+                    y="count:Q",
+                    color=alt.Color("severidade:N",scale=alt.Scale(
+                        domain=list(cm.keys()),range=list(cm.values())),legend=None),
+                    tooltip=["severidade","count"]
+                ).properties(height=250)
+                st.altair_chart(bar, use_container_width=True)
+            with c2:
+                st.subheader("Por Origem")
+                oc = df_det["origem"].value_counts().reset_index()
+                oc.columns = ["origem","count"]
+                pie = alt.Chart(oc).mark_arc(innerRadius=50).encode(
+                    theta="count:Q",color="origem:N",tooltip=["origem","count"]
+                ).properties(height=250)
+                st.altair_chart(pie, use_container_width=True)
+
+            st.subheader("Tendência temporal (por hora e severidade)")
+            df_t = df_det.copy()
+            df_t["hour"] = df_t["timestamp"].dt.floor("h")
+            trend = df_t.groupby(["hour","severidade"]).size().reset_index(name="count")
+            line = alt.Chart(trend).mark_line(point=True).encode(
+                x=alt.X("hour:T",title="Hora"),
+                y=alt.Y("count:Q",title="Nº riscos"),
+                color="severidade:N",
+                tooltip=["hour","severidade","count"]
+            ).properties(height=260)
+            st.altair_chart(line, use_container_width=True)
+
+    st.success("✅ No ambiente real, eventos viriam via SIEM/EDR/CVE feeds.")
+
+# --------------------------
+# Administração
+# --------------------------
+@require_roles(("admin",))
+def page_admin():
+    st.title("⚙️ Administração do Sistema")
+
+    tab_users, tab_access, tab_actions, tab_stats = st.tabs([
+        "👥 Utilizadores", "🔐 Logs de Acesso", "📝 Logs de Ações", "📊 Estatísticas"
+    ])
+
+    # --- Utilizadores ---
+    with tab_users:
+        with engine.connect() as conn:
+            users_df = pd.read_sql(select(
+                users.c.id, users.c.username, users.c.role,
+                users.c.full_name, users.c.is_active, users.c.last_login
+            ), conn)
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            with st.expander("➕ Criar novo utilizador"):
+                with st.form("create_user"):
+                    ca, cb = st.columns(2)
+                    username = ca.text_input("Login")
+                    fullname = cb.text_input("Nome completo")
+                    cc, cd   = st.columns(2)
+                    password = cc.text_input("Senha", type="password")
+                    role     = cd.selectbox("Perfil", ["admin","gestor","analista","auditor"])
+                    is_active= st.checkbox("Ativo", value=True)
+                    if st.form_submit_button("➕ Criar", use_container_width=True):
+                        if not username.strip() or not password.strip():
+                            st.warning("Login e senha obrigatórios.")
+                        else:
                             with engine.connect() as conn:
-                                conn.execute(
-                                    users.update()
-                                    .where(users.c.id == user_id_val)
-                                    .values(is_active=is_active_new)
-                                )
+                                res = conn.execute(users.insert().values(
+                                    username=username, password_hash=hash_password(password),
+                                    role=role, full_name=fullname, is_active=is_active
+                                ))
                                 conn.commit()
-                            
-                            log_action(
-                                actor=st.session_state["user"]["username"],
-                                role=st.session_state["user"]["role"],
-                                action="toggle_user_status",
-                                target_table="users",
-                                target_id=user_id_val,
-                                old_values={"is_active": current[1]},
-                                new_values={"is_active": is_active_new},
-                                details=f"Status alterado para {new_status}"
-                            )
-                            st.success(f"Usuário {'ativado' if is_active_new else 'desativado'}")
-                            st.rerun()
-    
-    # Tab 2: Logs de Acesso
-    with tabs[1]:
-        st.subheader("📋 Logs de Acesso (Login/Logout)")
-        
-        # Filtros
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            filter_user = st.text_input("Filtrar por usuário", "")
-        with col2:
-            filter_action = st.selectbox("Filtrar por ação", ["Todos", "login", "logout", "failed_login"])
-        with col3:
-            days_filter = st.selectbox("Últimos dias", [1, 7, 30, 90, 365], index=2)
-        
-        # Query com filtros
-        query = select(access_logs).order_by(access_logs.c.created_at.desc())
-        
-        if filter_user:
-            query = query.where(access_logs.c.username.ilike(f"%{filter_user}%"))
-        if filter_action != "Todos":
-            query = query.where(access_logs.c.action == filter_action)
-        
-        # Filtro de data
-        since_date = datetime.utcnow() - timedelta(days=days_filter)
-        query = query.where(access_logs.c.created_at >= since_date)
-        
+                                new_id = res.inserted_primary_key[0]
+                            log_action(st.session_state["user"]["username"],
+                                       st.session_state["user"]["role"],
+                                       "create_user","users",new_id,
+                                       new_values={"username":username,"role":role},
+                                       details=f"Utilizador criado: {username}")
+                            st.success("✅ Utilizador criado"); st.rerun()
+
+        with c2:
+            with st.expander("✏️ Editar / desativar utilizador"):
+                with st.form("edit_user"):
+                    u_opts = [f"{r.id} - {r.username}" for r in users_df.itertuples()]
+                    sel_u  = st.selectbox("Selecione", [""] + u_opts)
+                    if sel_u:
+                        uid    = int(sel_u.split(" - ")[0])
+                        urow   = get_row(users, uid)
+                        if urow:
+                            ca, cb   = st.columns(2)
+                            username = ca.text_input("Login", value=urow["username"])
+                            fullname = cb.text_input("Nome", value=urow["full_name"] or "")
+                            cc, cd   = st.columns(2)
+                            password = cc.text_input("Senha (em branco = manter)", type="password")
+                            role_opts= ["admin","gestor","analista","auditor"]
+                            role     = cd.selectbox("Perfil", role_opts,
+                                index=role_opts.index(urow["role"]) if urow["role"] in role_opts else 0)
+                            is_active= st.checkbox("Ativo", value=bool(urow.get("is_active", True)))
+                            ce, cf   = st.columns(2)
+                            save_u   = ce.form_submit_button("💾 Salvar", use_container_width=True)
+                            del_u    = cf.form_submit_button("🗑️ Excluir", use_container_width=True, type="primary")
+                            if save_u:
+                                vals = {"username":username,"role":role,
+                                        "full_name":fullname,"is_active":is_active}
+                                if password:
+                                    vals["password_hash"] = hash_password(password)
+                                update_row(users, uid, vals)
+                                log_action(st.session_state["user"]["username"],
+                                           st.session_state["user"]["role"],
+                                           "update_user","users",uid,
+                                           old_values={"username":urow["username"],"role":urow["role"]},
+                                           new_values={"username":username,"role":role,"is_active":is_active})
+                                st.success("✅ Atualizado"); st.rerun()
+                            if del_u:
+                                if uid == st.session_state["user"]["id"]:
+                                    st.error("Não pode excluir a sua própria conta.")
+                                else:
+                                    delete_row(users, uid)
+                                    log_action(st.session_state["user"]["username"],
+                                               st.session_state["user"]["role"],
+                                               "delete_user","users",uid,
+                                               old_values={"username":urow["username"]})
+                                    st.success("🗑️ Excluído"); st.rerun()
+                    else:
+                        st.form_submit_button("💾 Salvar", disabled=True, use_container_width=True)
+
+    # --- Logs de Acesso ---
+    with tab_access:
+        st.subheader("Logs de Login / Logout")
+        c1, c2, c3 = st.columns(3)
+        f_user   = c1.text_input("Utilizador", key="f_acc_user")
+        f_action = c2.selectbox("Ação", ["Todos","login","logout","failed_login"], key="f_acc_act")
+        f_days   = c3.selectbox("Últimos dias", [1,7,30,90,365], index=2, key="f_acc_days")
+
+        q = select(access_logs).order_by(access_logs.c.created_at.desc())
+        if f_user:
+            q = q.where(access_logs.c.username.ilike(f"%{f_user}%"))
+        if f_action != "Todos":
+            q = q.where(access_logs.c.action == f_action)
+        q = q.where(access_logs.c.created_at >= datetime.utcnow() - timedelta(days=f_days))
         with engine.connect() as conn:
-            access_logs_df = pd.read_sql(query.limit(500), conn)
-        
-        if not access_logs_df.empty:
-            # Estatísticas rápidas
-            st.metric("Total de registros", len(access_logs_df))
-            
-            # Tabela
+            acc_df = pd.read_sql(q.limit(500), conn)
+
+        if not acc_df.empty:
+            st.metric("Registos encontrados", len(acc_df))
             st.dataframe(
-                access_logs_df[[
-                    "created_at", "username", "role", "action", 
-                    "ip_address", "details"
-                ]].rename(columns={
-                    "created_at": "Data/Hora",
-                    "username": "Usuário",
-                    "role": "Perfil",
-                    "action": "Ação",
-                    "ip_address": "IP",
-                    "details": "Detalhes"
-                }),
-                use_container_width=True
+                acc_df[["created_at","username","role","action","ip_address","details"]]
+                .rename(columns={"created_at":"Data/Hora","username":"Utilizador",
+                                  "role":"Perfil","action":"Ação",
+                                  "ip_address":"IP","details":"Detalhes"}),
+                use_container_width=True, hide_index=True
             )
-            
-            # Visualizações
-            st.subheader("📈 Análise de Acessos")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Acessos por hora do dia
-                access_logs_df["hour"] = pd.to_datetime(access_logs_df["created_at"]).dt.hour
-                hourly_counts = access_logs_df.groupby("hour").size().reset_index(name="count")
-                bar_chart = alt.Chart(hourly_counts).mark_bar().encode(
-                    x=alt.X("hour:O", title="Hora do dia"),
-                    y=alt.Y("count:Q", title="Número de acessos"),
-                    tooltip=["hour", "count"]
-                )
-                st.altair_chart(bar_chart, use_container_width=True)
-            
-            with col2:
-                # Ações por tipo
-                action_counts = access_logs_df["action"].value_counts().reset_index()
-                action_counts.columns = ["action", "count"]
-                pie_chart = alt.Chart(action_counts).mark_arc().encode(
-                    theta="count:Q",
-                    color="action:N",
-                    tooltip=["action", "count"]
-                )
-                st.altair_chart(pie_chart, use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                acc_df["hour"] = pd.to_datetime(acc_df["created_at"]).dt.hour
+                hc = acc_df.groupby("hour").size().reset_index(name="count")
+                st.altair_chart(alt.Chart(hc).mark_bar().encode(
+                    x=alt.X("hour:O", title="Hora"),
+                    y=alt.Y("count:Q", title="Acessos"),
+                    tooltip=["hour","count"]
+                ).properties(height=220), use_container_width=True)
+            with c2:
+                ac = acc_df["action"].value_counts().reset_index()
+                ac.columns = ["action","count"]
+                st.altair_chart(alt.Chart(ac).mark_arc().encode(
+                    theta="count:Q", color="action:N", tooltip=["action","count"]
+                ).properties(height=220), use_container_width=True)
         else:
-            st.info("Nenhum registro de acesso encontrado com os filtros aplicados.")
-    
-    # Tab 3: Logs de Ações
-    with tabs[2]:
-        st.subheader("📝 Logs de Ações (CRUD)")
-        
-        # Filtros
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            filter_actor = st.text_input("Filtrar por executor", "")
-        with col2:
-            filter_table = st.selectbox("Filtrar por tabela", 
-                ["Todas", "policies", "assets", "risks", "incidents", "dsar", "audits", "trainings", "users"]
-            )
-        with col3:
-            filter_action_type = st.text_input("Filtrar por ação", "")
-        
-        # Query
-        query = select(audit_logs).order_by(audit_logs.c.created_at.desc())
-        
-        if filter_actor:
-            query = query.where(audit_logs.c.actor.ilike(f"%{filter_actor}%"))
-        if filter_table != "Todas":
-            query = query.where(audit_logs.c.target_table == filter_table)
-        if filter_action_type:
-            query = query.where(audit_logs.c.action.ilike(f"%{filter_action_type}%"))
-        
+            st.info("Nenhum registo encontrado.")
+
+    # --- Logs de Ações ---
+    with tab_actions:
+        st.subheader("Logs de Ações (CRUD)")
+        c1, c2, c3 = st.columns(3)
+        f_actor = c1.text_input("Executor", key="f_act_actor")
+        f_table = c2.selectbox("Tabela",
+            ["Todas","policies","assets","risks","incidents","dsar","audits","trainings","users"],
+            key="f_act_table")
+        f_atype = c3.text_input("Tipo de ação", key="f_act_type")
+
+        q2 = select(audit_logs).order_by(audit_logs.c.created_at.desc())
+        if f_actor: q2 = q2.where(audit_logs.c.actor.ilike(f"%{f_actor}%"))
+        if f_table != "Todas": q2 = q2.where(audit_logs.c.target_table == f_table)
+        if f_atype: q2 = q2.where(audit_logs.c.action.ilike(f"%{f_atype}%"))
         with engine.connect() as conn:
-            audit_logs_df = pd.read_sql(query.limit(300), conn)
-        
-        if not audit_logs_df.empty:
-            # Converter JSON strings para exibição melhor
-            def format_json(val):
-                if val and val != "None":
-                    try:
-                        parsed = json.loads(val)
-                        return json.dumps(parsed, indent=2, ensure_ascii=False)
-                    except:
-                        return val
-                return ""
-            
-            audit_logs_df["old_values_formatted"] = audit_logs_df["old_values"].apply(format_json)
-            audit_logs_df["new_values_formatted"] = audit_logs_df["new_values"].apply(format_json)
-            
-            # Tabela expandível
-            for _, row in audit_logs_df.iterrows():
-                with st.expander(f"{row['created_at']} | {row['actor']} ({row['role']}) → {row['action']} em {row['target_table']}"):
-                    col1, col2 = st.columns(2)
-                    with col1:
+            aud_df = pd.read_sql(q2.limit(300), conn)
+
+        if not aud_df.empty:
+            def fmt_json(v):
+                if v:
+                    try: return json.dumps(json.loads(v), indent=2, ensure_ascii=False)
+                    except: return v
+                return "—"
+
+            for _, r in aud_df.iterrows():
+                with st.expander(
+                    f"{r['created_at']}  |  **{r['actor']}** ({r['role']})  →  "
+                    f"`{r['action']}` em `{r['target_table']}`"
+                ):
+                    ca, cb = st.columns(2)
+                    with ca:
                         st.write("**Antes:**")
-                        st.code(row["old_values_formatted"] if row["old_values_formatted"] else "N/A", language="json")
-                    with col2:
+                        st.code(fmt_json(r["old_values"]), language="json")
+                    with cb:
                         st.write("**Depois:**")
-                        st.code(row["new_values_formatted"] if row["new_values_formatted"] else "N/A", language="json")
-                    
-                    st.write(f"**Detalhes:** {row['details']}")
-                    st.write(f"**IP:** {row['ip_address']}")
-                    st.write(f"**User Agent:** {row['user_agent']}")
+                        st.code(fmt_json(r["new_values"]), language="json")
+                    st.caption(f"Detalhes: {r['details']}  |  IP: {r['ip_address']}")
         else:
-            st.info("Nenhum log de ação encontrado com os filtros aplicados.")
-    
-    # Tab 4: Estatísticas
-    with tabs[3]:
-        st.subheader("📊 Estatísticas do Sistema")
-        
+            st.info("Nenhum log encontrado.")
+
+    # --- Estatísticas ---
+    with tab_stats:
+        st.subheader("Estatísticas do Sistema")
+        thirty_ago = datetime.utcnow() - timedelta(days=30)
         with engine.connect() as conn:
-            # Contagens básicas
-            total_users = conn.execute(select(func.count()).select_from(users)).scalar()
-            active_users = conn.execute(select(func.count()).select_from(users).where(users.c.is_active == True)).scalar()
-            total_logins = conn.execute(select(func.count()).select_from(access_logs).where(access_logs.c.action == "login")).scalar()
-            total_actions = conn.execute(select(func.count()).select_from(audit_logs)).scalar()
-            
-            # Últimos 30 dias
-            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-            recent_logins = conn.execute(
-                select(func.count()).select_from(access_logs)
-                .where(access_logs.c.action == "login")
-                .where(access_logs.c.created_at >= thirty_days_ago)
-            ).scalar()
-            
-            recent_actions = conn.execute(
-                select(func.count()).select_from(audit_logs)
-                .where(audit_logs.c.created_at >= thirty_days_ago)
-            ).scalar()
-        
-        # Métricas
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Usuários Ativos", active_users, f"Total: {total_users}")
-        col2.metric("Logins (30 dias)", recent_logins, f"Total: {total_logins}")
-        col3.metric("Ações (30 dias)", recent_actions, f"Total: {total_actions}")
-        
-        # Gráfico de atividades por dia
+            total_users  = conn.execute(select(func.count()).select_from(users)).scalar()
+            active_users = conn.execute(select(func.count()).select_from(users)
+                                        .where(users.c.is_active == True)).scalar()
+            total_logins = conn.execute(select(func.count()).select_from(access_logs)
+                                        .where(access_logs.c.action=="login")).scalar()
+            total_actions= conn.execute(select(func.count()).select_from(audit_logs)).scalar()
+            recent_logins= conn.execute(select(func.count()).select_from(access_logs)
+                                        .where(access_logs.c.action=="login")
+                                        .where(access_logs.c.created_at>=thirty_ago)).scalar()
+            recent_acts  = conn.execute(select(func.count()).select_from(audit_logs)
+                                        .where(audit_logs.c.created_at>=thirty_ago)).scalar()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Utilizadores Ativos", active_users, f"Total: {total_users}")
+        c2.metric("Logins (30 dias)", recent_logins, f"Total: {total_logins}")
+        c3.metric("Ações (30 dias)", recent_acts, f"Total: {total_actions}")
+
         with engine.connect() as conn:
-            daily_activities = pd.read_sql(
-                select(
-                    func.date(audit_logs.c.created_at).label("date"),
-                    func.count().label("count")
-                )
-                .where(audit_logs.c.created_at >= thirty_days_ago)
+            daily = pd.read_sql(
+                select(func.date(audit_logs.c.created_at).label("date"),
+                       func.count().label("count"))
+                .where(audit_logs.c.created_at >= thirty_ago)
                 .group_by(func.date(audit_logs.c.created_at))
                 .order_by(func.date(audit_logs.c.created_at)),
                 conn
             )
-        
-        if not daily_activities.empty:
-            st.subheader("Atividades por Dia (últimos 30 dias)")
-            line_chart = alt.Chart(daily_activities).mark_line(point=True).encode(
-                x=alt.X("date:T", title="Data"),
-                y=alt.Y("count:Q", title="Número de ações"),
-                tooltip=["date", "count"]
-            )
-            st.altair_chart(line_chart, use_container_width=True)
-        
-        # Top usuários por atividade
-        with engine.connect() as conn:
-            top_users = pd.read_sql(
-                select(
-                    audit_logs.c.actor,
-                    audit_logs.c.role,
-                    func.count().label("action_count")
-                )
-                .where(audit_logs.c.created_at >= thirty_days_ago)
+            top_u = pd.read_sql(
+                select(audit_logs.c.actor, audit_logs.c.role,
+                       func.count().label("action_count"))
+                .where(audit_logs.c.created_at >= thirty_ago)
                 .group_by(audit_logs.c.actor, audit_logs.c.role)
-                .order_by(func.count().desc())
-                .limit(10),
+                .order_by(func.count().desc()).limit(10),
                 conn
             )
-        
-        if not top_users.empty:
-            st.subheader("Top 10 Usuários por Atividade (30 dias)")
-            bar_chart = alt.Chart(top_users).mark_bar().encode(
-                x=alt.X("action_count:Q", title="Número de ações"),
-                y=alt.Y("actor:N", sort="-x", title="Usuário"),
+
+        if not daily.empty:
+            st.subheader("Atividade por dia (30 dias)")
+            st.altair_chart(alt.Chart(daily).mark_line(point=True).encode(
+                x=alt.X("date:T", title="Data"),
+                y=alt.Y("count:Q", title="Ações"),
+                tooltip=["date","count"]
+            ).properties(height=240), use_container_width=True)
+
+        if not top_u.empty:
+            st.subheader("Top 10 utilizadores por atividade")
+            st.altair_chart(alt.Chart(top_u).mark_bar().encode(
+                x=alt.X("action_count:Q", title="Nº de ações"),
+                y=alt.Y("actor:N", sort="-x", title="Utilizador"),
                 color=alt.Color("role:N", title="Perfil"),
-                tooltip=["actor", "role", "action_count"]
-            )
-            st.altair_chart(bar_chart, use_container_width=True)
+                tooltip=["actor","role","action_count"]
+            ).properties(height=300), use_container_width=True)
 
 # --------------------------
 # Main
 # --------------------------
 def main():
     st.set_page_config(page_title="CISP Governance", layout="wide", page_icon="🛡️")
-    
-    # Estilo CSS adicional
-    st.markdown("""
-        <style>
-        .main .block-container {
-            padding-top: 2rem;
-        }
-        h1, h2, h3 {
-            color: #1E3A8A;
-        }
-        .stButton button {
-            background-color: #3B82F6;
-            color: white;
-            border-radius: 5px;
-        }
-        .stButton button:hover {
-            background-color: #2563EB;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
+    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
     bootstrap()
+
     if "user" not in st.session_state:
         st.session_state["user"] = None
 
     if not st.session_state["user"]:
         login_ui()
-    else:
-        nav_bar()
+        return
+
+    user = st.session_state["user"]
+    choice = sidebar_nav(user)
+
+    page_map = {
+        "📊 Dashboard":           page_dashboard,
+        "📘 Políticas":           page_policies,
+        "🗂️ Ativos & Riscos":    page_assets_risks,
+        "🚨 Incidentes":          page_incidents,
+        "📄 Proteção de Dados":   page_privacy,
+        "🔍 Auditorias":          page_audits,
+        "🎓 Treinamentos":        page_trainings,
+        "🤖 Detecção Automática": page_detect_autonomous,
+        "⚙️ Administração":       page_admin,
+    }
+    fn = page_map.get(choice)
+    if fn:
+        fn()
 
 if __name__ == "__main__":
     main()
